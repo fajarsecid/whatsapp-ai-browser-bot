@@ -16,8 +16,8 @@ Bot ini tidak memakai OpenAI API key, Gemini API key, atau model lokal. Semua ja
 - Batas antrean per chat agar spam pesan tidak menumpuk terlalu panjang.
 - Retry otomatis saat browser AI timeout atau macet: browser di-reload lalu request dicoba ulang.
 - Remote login dari HP lewat panel screenshot browser.
-- ChatGPT bisa login manual tanpa cookie. Cookie hanya opsi cadangan.
-- Session, cookie, `.env`, browser profile, dan backup sudah di-ignore dari Git.
+- ChatGPT memakai login manual di browser profile, tanpa import cookie.
+- Session, `.env`, browser profile, dan backup sudah di-ignore dari Git.
 
 ## Cara Kerja
 
@@ -109,6 +109,8 @@ PAIRING_PHONE_NUMBER=6281234567890
 
 # Browser profile. Kosongkan agar otomatis per service.
 BROWSER_PROFILE=
+GEMINI_BROWSER_PROFILE=./browser-profile-gemini
+CHATGPT_BROWSER_PROFILE=./browser-profile
 WEB_AI_HEADLESS=false
 
 # File penyimpanan mode dan pilihan AI per chat.
@@ -128,12 +130,13 @@ ANSWER_STABLE_INTERVAL_MS=300
 ANSWER_STABLE_CHECKS=2
 ```
 
-Catatan `BROWSER_PROFILE`:
+Catatan profile browser:
 
-- Kosongkan `BROWSER_PROFILE` untuk memakai profile otomatis.
+- Pakai `GEMINI_BROWSER_PROFILE` dan `CHATGPT_BROWSER_PROFILE` jika ingin path eksplisit per service.
+- Kosongkan `BROWSER_PROFILE` untuk memakai profile otomatis atau profile per service di atas.
 - Gemini otomatis memakai `./browser-profile-gemini`.
 - ChatGPT otomatis memakai `./browser-profile`.
-- Jika `BROWSER_PROFILE` diisi manual, Gemini dan ChatGPT akan memakai profile yang sama. Ini tidak disarankan untuk bot yang bisa switch per chat.
+- `BROWSER_PROFILE` adalah opsi lama. Di bot utama, nilai ini hanya dipakai untuk service default saat start agar switch Gemini/ChatGPT tidak berbenturan.
 
 ## Login WhatsApp
 
@@ -207,9 +210,9 @@ Catatan:
 - Jangan share URL remote login.
 - Jika session AI expired, ulangi login untuk AI tersebut.
 
-## ChatGPT Cookie Opsional
+## Login ChatGPT
 
-ChatGPT tidak wajib memakai `cookie.js`. Cara utama yang disarankan adalah login manual:
+ChatGPT memakai session browser profile dari login manual:
 
 ```bash
 npm run login:chatgpt
@@ -221,13 +224,7 @@ atau:
 npm run remote-login:chatgpt
 ```
 
-Jika sudah punya export cookie ChatGPT:
-
-```bash
-npm run import:cookies
-```
-
-Saat ChatGPT dipakai, bot mencoba load `cookie.js` jika file ada. Jika tidak ada, bot tetap memakai browser profile manual login.
+Tunggu sampai halaman chat terbuka sebelum menutup login.
 
 ## Start Bot
 
@@ -423,7 +420,6 @@ Saat retry, bot mengirim pesan singkat bahwa browser AI lambat atau macet, lalu 
 - `browser-profile/`: login ChatGPT.
 - `ai-modes.json`: mode jawaban per chat.
 - `ai-services.json`: pilihan Gemini/ChatGPT per chat dan default.
-- `cookie.js`: cookie ChatGPT opsional.
 
 File-file ini sensitif dan sudah masuk `.gitignore`.
 
@@ -486,7 +482,7 @@ npm run remote-login:chatgpt
 
 ### ChatGPT Berhenti Di `Just a moment...`
 
-Tunggu beberapa saat. Jika tetap berhenti, login ulang manual/remote sampai halaman chat terbuka. Cookie tidak wajib, tapi jika memakai cookie, pastikan cookie belum expired dan user-agent cocok.
+Tunggu beberapa saat. Jika tetap berhenti, login ulang manual/remote sampai halaman chat terbuka.
 
 ### Remote Login Tidak Bisa Dibuka Dari HP
 
@@ -575,7 +571,6 @@ Yang aman di-commit:
 Yang tidak boleh di-commit:
 
 - `.env`
-- `cookie.js`
 - `ai-modes.json`
 - `ai-services.json`
 - `session/`

@@ -1,6 +1,7 @@
 import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import { chromium } from 'playwright';
+import { resolveBrowserProfile } from './src/browser-profile.js';
 import { loadEnvFile } from './src/env.js';
 
 loadEnvFile();
@@ -8,19 +9,17 @@ loadEnvFile();
 const TARGETS = Object.freeze({
   chatgpt: {
     label: 'ChatGPT',
-    url: 'https://chatgpt.com',
-    profile: './browser-profile'
+    url: 'https://chatgpt.com'
   },
   gemini: {
     label: 'Gemini',
-    url: 'https://gemini.google.com/app',
-    profile: './browser-profile-gemini'
+    url: 'https://gemini.google.com/app'
   }
 });
 
 const targetName = normalizeTarget(process.argv[2] || process.env.WEB_AI_SERVICE || 'chatgpt');
 const target = TARGETS[targetName];
-const BROWSER_PROFILE = process.env.BROWSER_PROFILE || target.profile;
+const BROWSER_PROFILE = resolveBrowserProfile(targetName);
 const LOGIN_HEADLESS = parseBooleanEnv(process.env.LOGIN_HEADLESS, false);
 const BROWSER_USER_AGENT = process.env.BROWSER_USER_AGENT || '';
 

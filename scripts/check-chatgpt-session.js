@@ -1,11 +1,10 @@
 import { chromium } from 'playwright';
-import { DEFAULT_CHATGPT_COOKIE_FILE, addChatGptCookiesFromFile } from '../src/chatgpt-cookies.js';
+import { resolveBrowserProfile } from '../src/browser-profile.js';
 import { loadEnvFile } from '../src/env.js';
 
 loadEnvFile();
 
-const BROWSER_PROFILE = process.env.BROWSER_PROFILE || './browser-profile';
-const COOKIE_FILE = process.argv[2] || process.env.CHATGPT_COOKIE_FILE || DEFAULT_CHATGPT_COOKIE_FILE;
+const BROWSER_PROFILE = resolveBrowserProfile('chatgpt');
 const CHATGPT_URL = 'https://chatgpt.com/';
 const CHATGPT_HEADLESS = parseBooleanEnv(process.env.CHATGPT_HEADLESS, true);
 const CHATGPT_USER_AGENT = process.env.CHATGPT_USER_AGENT || '';
@@ -21,7 +20,6 @@ try {
   });
   await prepareContext(context);
 
-  const cookieResult = await addChatGptCookiesFromFile(context, COOKIE_FILE);
   const page = context.pages()[0] || (await context.newPage());
 
   await page.goto(CHATGPT_URL, {
@@ -35,7 +33,6 @@ try {
     title: await page.title().catch(() => ''),
     userAgent: await page.evaluate(() => navigator.userAgent).catch(() => ''),
     webdriver: await page.evaluate(() => navigator.webdriver).catch(() => null),
-    cookiesLoaded: cookieResult.added,
     promptTextarea: await isVisible(page, '#prompt-textarea'),
     contentEditable: await isVisible(page, '[contenteditable="true"]'),
     textarea: await isVisible(page, 'textarea'),

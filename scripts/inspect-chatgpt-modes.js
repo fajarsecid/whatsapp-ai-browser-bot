@@ -1,9 +1,10 @@
 import { chromium } from 'playwright';
+import { resolveBrowserProfile } from '../src/browser-profile.js';
 import { loadEnvFile } from '../src/env.js';
 
 loadEnvFile();
 
-const profile = process.env.BROWSER_PROFILE || './browser-profile';
+const profile = resolveBrowserProfile('chatgpt');
 const userAgent = process.env.BROWSER_USER_AGENT || process.env.CHATGPT_USER_AGENT || '';
 const screenshotPath = process.env.SCREENSHOT_PATH || '';
 

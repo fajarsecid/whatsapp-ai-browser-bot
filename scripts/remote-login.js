@@ -1,6 +1,7 @@
 import { createServer } from 'node:http';
 import { randomBytes } from 'node:crypto';
 import { chromium } from 'playwright';
+import { resolveBrowserProfile } from '../src/browser-profile.js';
 import { loadEnvFile } from '../src/env.js';
 
 loadEnvFile();
@@ -8,13 +9,11 @@ loadEnvFile();
 const TARGETS = Object.freeze({
   chatgpt: {
     label: 'ChatGPT',
-    url: 'https://chatgpt.com',
-    profile: './browser-profile'
+    url: 'https://chatgpt.com'
   },
   gemini: {
     label: 'Gemini',
-    url: 'https://gemini.google.com/app',
-    profile: './browser-profile-gemini'
+    url: 'https://gemini.google.com/app'
   }
 });
 
@@ -24,7 +23,7 @@ const host = process.env.REMOTE_LOGIN_HOST || '0.0.0.0';
 const port = Number.parseInt(process.env.REMOTE_LOGIN_PORT || '8787', 10);
 const token = process.env.REMOTE_LOGIN_TOKEN || randomBytes(12).toString('hex');
 const publicUrl = normalizePublicUrl(process.env.REMOTE_LOGIN_PUBLIC_URL || '');
-const profile = process.env.BROWSER_PROFILE || target.profile;
+const profile = resolveBrowserProfile(targetName);
 const userAgent = process.env.BROWSER_USER_AGENT || '';
 
 let context;

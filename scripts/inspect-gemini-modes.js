@@ -1,9 +1,10 @@
 import { chromium } from 'playwright';
+import { resolveBrowserProfile } from '../src/browser-profile.js';
 import { loadEnvFile } from '../src/env.js';
 
 loadEnvFile();
 
-const profile = process.env.BROWSER_PROFILE || './browser-profile-gemini';
+const profile = resolveBrowserProfile('gemini');
 const modeButtonSelectorList = [
   'button[aria-label="Buka pemilih mode"]',
   'button[aria-label*="pemilih mode"]',

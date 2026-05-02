@@ -11,7 +11,7 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys';
 import P from 'pino';
 import qrcode from 'qrcode-terminal';
-import { addChatGptCookiesFromFile } from './src/chatgpt-cookies.js';
+import { resolveBrowserProfile as resolveServiceBrowserProfile } from './src/browser-profile.js';
 import { loadEnvFile } from './src/env.js';
 import { splitWhatsAppText } from './src/whatsapp.js';
 
@@ -23,13 +23,14 @@ const WA_AUTH_DIR = process.env.AUTH_DIR || './session';
 const DEFAULT_WEB_AI_SERVICE = 'gemini';
 const WEB_AI_SERVICE_ARG = IS_MAIN_MODULE ? process.argv[2] || '' : '';
 const CHATGPT_USER_AGENT = process.env.CHATGPT_USER_AGENT || '';
-const CHATGPT_COOKIE_FILE = process.env.CHATGPT_COOKIE_FILE || './cookie.js';
 const AI_MODE_FILE = process.env.AI_MODE_FILE || './ai-modes.json';
 const AI_SERVICE_FILE = process.env.AI_SERVICE_FILE || './ai-services.json';
 const WA_ALLOWED = [];
 const savedAiServices = loadAiServices();
-let webAiService = savedAiServices.defaultService ||
+const startupWebAiService =
+  savedAiServices.defaultService ||
   normalizeWebAiService(WEB_AI_SERVICE_ARG || process.env.WEB_AI_SERVICE || DEFAULT_WEB_AI_SERVICE);
+let webAiService = startupWebAiService;
 let browserProfile = resolveBrowserProfile(webAiService);
 let browserUserAgent = resolveBrowserUserAgent(webAiService);
 
@@ -364,6 +365,10 @@ export async function askWebAi(
         continue;
       }
 
+      if (shouldResetWebAiAfterError(error)) {
+        await resetWebAiBrowser(aiService);
+      }
+
       throw error;
     }
     finally {
@@ -433,18 +438,24 @@ async function launchWebAiPage(service) {
   state.profile = resolveBrowserProfile(aiService);
   state.userAgent = resolveBrowserUserAgent(aiService);
 
-  const context = await chromium.launchPersistentContext(state.profile, {
-    headless: WEB_AI_HEADLESS,
-    ...getWebAiBrowserOptions(aiService),
-    ...(state.userAgent ? { userAgent: state.userAgent } : {}),
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled']
-  });
+  let context;
+  try {
+    context = await chromium.launchPersistentContext(state.profile, {
+      headless: WEB_AI_HEADLESS,
+      ...getWebAiBrowserOptions(aiService),
+      ...(state.userAgent ? { userAgent: state.userAgent } : {}),
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled']
+    });
+  } catch (error) {
+    if (isBrowserProfileInUseError(error)) {
+      throw new BrowserProfileInUseError(aiService, state.profile, error);
+    }
+
+    throw error;
+  }
 
   state.context = context;
   await prepareWebAiContext(context);
-  if (aiService === 'chatgpt') {
-    await loadChatGptCookies(context);
-  }
 
   context.on('close', () => {
     clearWebAiSessions(aiService);
@@ -578,6 +589,9 @@ function warmWebAiBrowser(service = webAiService) {
   })()
     .catch((error) => {
       console.warn(`Gagal warmup ${warmupLabel}: ${error.message}`);
+      if (shouldResetWebAiAfterError(error)) {
+        return resetWebAiBrowser(warmupService);
+      }
     })
     .finally(() => {
       if (state.warmupPromise === warmupPromise) {
@@ -636,17 +650,6 @@ function getWebAiBrowserOptions(service = webAiService) {
   return {
     viewport: { width: 1280, height: 900 }
   };
-}
-
-async function loadChatGptCookies(context) {
-  try {
-    const result = await addChatGptCookiesFromFile(context, CHATGPT_COOKIE_FILE);
-    if (result.added > 0) {
-      console.log(`Loaded ${result.added} ChatGPT cookies from ${CHATGPT_COOKIE_FILE}.`);
-    }
-  } catch (error) {
-    console.warn(`Gagal load cookie ChatGPT dari ${CHATGPT_COOKIE_FILE}: ${error.message}`);
-  }
 }
 
 async function askChatGPTOnPage(page, question, mode) {
@@ -1355,6 +1358,10 @@ function shouldRetryWebAi(error) {
   return error instanceof SessionExpiredError || error instanceof SelectorTimeoutError || isTimeoutError(error);
 }
 
+function shouldResetWebAiAfterError(error) {
+  return error instanceof ChatGptGateError || error instanceof BrowserProfileInUseError;
+}
+
 async function resetWebAiBrowser(service = webAiService) {
   const aiService = normalizeWebAiService(service);
   const state = getWebAiState(aiService);
@@ -1899,7 +1906,7 @@ function getModeBehaviorDescription(service = webAiService) {
 }
 
 function resolveBrowserProfile(service) {
-  return process.env.BROWSER_PROFILE || (service === 'gemini' ? './browser-profile-gemini' : './browser-profile');
+  return resolveServiceBrowserProfile(service, { legacyService: startupWebAiService });
 }
 
 function resolveBrowserUserAgent(service) {
@@ -1988,7 +1995,11 @@ function printSelectedWebAiService(reason = '') {
 function formatWhatsAppError(error, service = webAiService) {
   const label = getWebAiLabel(service);
   if (error instanceof ChatGptGateError) {
-    return 'ChatGPT belum bisa dibuka: browser tertahan di halaman security check / "Just a moment...". Cookie perlu di-refresh atau login manual ulang sampai halaman chat terbuka.';
+    return 'ChatGPT belum bisa dibuka: browser tertahan di halaman security check / "Just a moment...". Login manual ulang sampai halaman chat terbuka, lalu start bot lagi.';
+  }
+
+  if (error instanceof BrowserProfileInUseError) {
+    return `Browser ${label} belum bisa dibuka karena profile sedang dipakai: ${error.profile}.\nTutup proses bot/browser lain yang memakai profile itu, atau pakai profile berbeda untuk Gemini dan ChatGPT.`;
   }
 
   if (error instanceof SessionExpiredError) {
@@ -2005,6 +2016,10 @@ function formatWhatsAppError(error, service = webAiService) {
 
 function isTimeoutError(error) {
   return error instanceof playwrightErrors.TimeoutError || /timeout/i.test(error?.message || '');
+}
+
+function isBrowserProfileInUseError(error) {
+  return /ProcessSingleton|SingletonLock|profile directory.*in use/i.test(error?.message || '');
 }
 
 function isChatGptGate({ title = '', body = '' } = {}) {
@@ -2030,6 +2045,15 @@ class ChatGptGateError extends Error {
   constructor() {
     super('ChatGPT security gate is blocking the browser session.');
     this.name = 'ChatGptGateError';
+  }
+}
+
+class BrowserProfileInUseError extends Error {
+  constructor(service, profile, cause) {
+    super(`Profile browser ${getWebAiLabel(service)} sedang dipakai: ${profile}.`);
+    this.name = 'BrowserProfileInUseError';
+    this.profile = profile;
+    this.cause = cause;
   }
 }
 

@@ -16,12 +16,11 @@
     "login:gemini": "node login.js gemini",
     "remote-login:chatgpt": "xvfb-run -a node scripts/remote-login.js chatgpt",
     "remote-login:gemini": "xvfb-run -a node scripts/remote-login.js gemini",
-    "import:cookies": "xvfb-run -a node scripts/import-chatgpt-cookies.js",
     "check:chatgpt": "node scripts/check-chatgpt-session.js",
     "check:chatgpt:xvfb": "CHATGPT_HEADLESS=false xvfb-run -a node scripts/check-chatgpt-session.js",
     "check:gemini:xvfb": "WEB_AI_HEADLESS=false xvfb-run -a node scripts/check-gemini-session.js",
     "dev": "node --watch index.js",
-    "test": "node --check index.js && node --check login.js && node --check src/chatgpt-cookies.js && node --check scripts/import-chatgpt-cookies.js && node --check scripts/check-chatgpt-session.js && node --check scripts/check-gemini-session.js && node --check scripts/inspect-gemini-modes.js && node --check scripts/inspect-chatgpt-modes.js && node --check scripts/remote-login.js && node --test test/chatgpt-cookies.test.js"
+    "test": "node --check index.js && node --check login.js && node --check src/browser-profile.js && node --check scripts/check-chatgpt-session.js && node --check scripts/check-gemini-session.js && node --check scripts/inspect-gemini-modes.js && node --check scripts/inspect-chatgpt-modes.js && node --check scripts/remote-login.js && node --test test/browser-profile.test.js"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^7.0.0-rc.9",
