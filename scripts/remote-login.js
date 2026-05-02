@@ -23,6 +23,7 @@ const target = TARGETS[targetName];
 const host = process.env.REMOTE_LOGIN_HOST || '0.0.0.0';
 const port = Number.parseInt(process.env.REMOTE_LOGIN_PORT || '8787', 10);
 const token = process.env.REMOTE_LOGIN_TOKEN || randomBytes(12).toString('hex');
+const publicUrl = normalizePublicUrl(process.env.REMOTE_LOGIN_PUBLIC_URL || '');
 const profile = process.env.BROWSER_PROFILE || target.profile;
 const userAgent = process.env.BROWSER_USER_AGENT || '';
 
@@ -52,7 +53,13 @@ try {
   const server = createServer(handleRequest);
   server.listen(port, host, () => {
     console.log(`${target.label} remote login ready.`);
-    console.log(`Buka dari HP: http://<IP-VPS>:${port}/?token=${token}`);
+    if (publicUrl) {
+      console.log(`Buka dari HP: ${publicUrl}/?token=${token}`);
+    } else {
+      console.log(`Port lokal remote login: http://127.0.0.1:${port}/?token=${token}`);
+      console.log('Di VPS, buka dari HP lewat domain HTTPS/tunnel yang mengarah ke port ini, bukan IP VPS mentah.');
+      console.log(`Contoh: https://subdomain.lhr.life/?token=${token}`);
+    }
     console.log(`Profile: ${profile}`);
     console.log('Setelah login selesai dan halaman chat terbuka, tekan tombol Done di panel.');
   });
@@ -340,6 +347,17 @@ function normalizeTarget(value) {
 
   if (!Object.hasOwn(TARGETS, normalized)) {
     throw new Error('Target remote login harus "chatgpt" atau "gemini".');
+  }
+
+  return normalized;
+}
+
+function normalizePublicUrl(value) {
+  const normalized = String(value || '').trim().replace(/\/+$/, '');
+  if (!normalized) return '';
+
+  if (!/^https?:\/\//i.test(normalized)) {
+    throw new Error('REMOTE_LOGIN_PUBLIC_URL harus diawali http:// atau https://.');
   }
 
   return normalized;
