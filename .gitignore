@@ -3,6 +3,7 @@
 !.env.example
 cookie.js
 ai-modes.json
+ai-services.json
 node_modules/
 npm-debug.log*
 coverage/

@@ -1,243 +1,233 @@
 # WhatsApp AI Browser Bot
 
-Bot WhatsApp yang mengambil jawaban dari AI web lewat browser otomatis. Bot ini bisa memakai Gemini atau ChatGPT yang sudah login di browser profile lokal server.
+Bot WhatsApp yang mengambil jawaban dari AI web lewat browser otomatis. Bot ini memakai WhatsApp via Baileys dan mengontrol halaman Gemini atau ChatGPT lewat Playwright.
 
-Bot ini tidak memakai OpenAI API key, Gemini API key, atau model lokal. Semua jawaban diambil dari halaman web AI yang dibuka Playwright.
+Bot ini tidak memakai OpenAI API key, Gemini API key, atau model lokal. Semua jawaban diambil dari akun Gemini/ChatGPT yang sudah login di browser profile server.
 
 ## Fitur
 
 - WhatsApp bot via Baileys.
-- AI browser: Gemini atau ChatGPT.
-- Login AI disimpan di browser profile, jadi tidak perlu login ulang setiap start.
-- Mode jawaban per chat.
-- Remote login dari HP lewat panel browser screenshot.
+- AI browser: Gemini dan ChatGPT.
+- Login AI disimpan di browser profile lokal server.
+- Switch Gemini/ChatGPT per chat dari WhatsApp.
+- Default AI browser disimpan lintas restart di `ai-services.json`.
+- Mode jawaban per chat: `auto`, `cepat/instant`, `penalaran/thinking`, `pro`.
+- Command `.ai status` untuk melihat AI aktif, mode, antrean, dan status browser.
+- Batas antrean per chat agar spam pesan tidak menumpuk terlalu panjang.
+- Retry otomatis saat browser AI timeout atau macet: browser di-reload lalu request dicoba ulang.
+- Remote login dari HP lewat panel screenshot browser.
 - ChatGPT bisa login manual tanpa cookie. Cookie hanya opsi cadangan.
 - Session, cookie, `.env`, browser profile, dan backup sudah di-ignore dari Git.
 
 ## Cara Kerja
 
-1. Bot start dengan service AI yang dipilih: `gemini` atau `chatgpt`.
-2. Bot login ke WhatsApp memakai session Baileys di folder `session/`.
-3. User mengirim pesan WhatsApp.
-4. Bot membuka browser profile AI yang sudah login.
-5. Bot memilih mode AI, mengetik pertanyaan, menunggu jawaban, lalu mengirim jawaban balik ke WhatsApp.
+1. Bot start dan login ke WhatsApp memakai session Baileys di `AUTH_DIR`, default `./session`.
+2. Saat WhatsApp tersambung, bot warmup AI browser default.
+3. Private chat bisa langsung bertanya tanpa prefix.
+4. Group wajib memakai prefix `.ai`.
+5. Untuk setiap chat, bot menentukan AI browser yang dipakai:
+   - pilihan per chat dari `.ai mode gemini/chatgpt`, atau
+   - default dari `ai-services.json` / `WEB_AI_SERVICE`.
+6. Bot membuka browser profile AI yang sesuai:
+   - Gemini: `./browser-profile-gemini`
+   - ChatGPT: `./browser-profile`
+7. Bot memilih mode AI sesuai command chat atau auto-classifier.
+8. Bot mengetik pertanyaan ke web AI, menunggu jawaban final, lalu mengirim balasan ke WhatsApp.
+9. Kalau web AI timeout, bot reload browser AI tersebut dan mencoba ulang sesuai `WEB_AI_MAX_ATTEMPTS`.
 
 ## Requirement
 
 - Node.js 20 atau lebih baru.
 - `npm`.
-- Browser Chromium dari Playwright.
-- Linux VPS disarankan memakai `xvfb-run` karena browser berjalan non-headless untuk menjaga kompatibilitas web AI.
+- Chromium dari Playwright.
+- Linux VPS disarankan memakai `xvfb-run` karena Gemini/ChatGPT sering lebih stabil dalam mode non-headless.
 - Akun Gemini dan/atau ChatGPT yang bisa login manual.
 - WhatsApp aktif untuk pairing bot.
 
-Install dependency:
+## Install Dari Nol
+
+Clone repo:
+
+```bash
+git clone https://github.com/fajarsecid/whatsapp-ai-browser-bot.git
+cd whatsapp-ai-browser-bot
+```
+
+Install dependency Node.js:
 
 ```bash
 npm install
 ```
 
-Kalau Playwright browser belum ada:
+Install browser Chromium Playwright:
 
 ```bash
 npx playwright install chromium
 ```
 
-Di beberapa VPS, dependency Chromium juga perlu dipasang:
+Jika VPS belum punya dependency sistem Chromium:
 
 ```bash
 npx playwright install-deps chromium
 ```
 
-## File Penting
+Install tool runtime untuk VPS headless jika belum ada:
 
-- `index.js`: main bot WhatsApp dan otomasi browser Gemini/ChatGPT.
-- `login.js`: login manual kalau server punya GUI/browser yang bisa dibuka.
-- `scripts/remote-login.js`: login dari HP lewat panel remote.
-- `src/chatgpt-cookies.js`: helper import cookie ChatGPT opsional.
-- `.env.example`: contoh konfigurasi.
-- `package.json`: daftar script.
+```bash
+sudo apt-get update
+sudo apt-get install -y xvfb
+```
 
-## File Yang Tidak Boleh Diupload
-
-File berikut berisi data sensitif dan sudah masuk `.gitignore`:
-
-- `.env`
-- `cookie.js`
-- `ai-modes.json`
-- `session/`
-- `auth_info_baileys*/`
-- `browser-profile/`
-- `browser-profile-gemini/`
-- `.wwebjs_auth/`
-- `backups/`
-- `node_modules/`
-
-Jangan upload folder atau file tersebut ke GitHub. Kalau repo dipindah ke server baru, login WhatsApp, Gemini, dan ChatGPT harus dibuat ulang di server baru.
-
-## Konfigurasi
-
-Buat `.env` dari contoh:
+Salin konfigurasi:
 
 ```bash
 cp .env.example .env
 ```
 
-Variabel yang paling sering dipakai:
+Edit `.env`:
 
 ```env
 WEB_AI_SERVICE=gemini
 AUTH_DIR=./session
 USE_PAIRING_CODE=true
-PAIRING_PHONE_NUMBER=
-BROWSER_PROFILE=./browser-profile-gemini
+PAIRING_PHONE_NUMBER=6281234567890
 WEB_AI_HEADLESS=false
 ```
 
-Service yang valid:
+`PAIRING_PHONE_NUMBER` wajib format internasional tanpa `+`, spasi, atau awalan `0`.
+
+## Konfigurasi Penting
 
 ```env
+# AI default saat bot pertama kali start.
 WEB_AI_SERVICE=gemini
-WEB_AI_SERVICE=chatgpt
+
+# Session WhatsApp.
+AUTH_DIR=./session
+USE_PAIRING_CODE=true
+PAIRING_PHONE_NUMBER=6281234567890
+
+# Browser profile. Kosongkan agar otomatis per service.
+BROWSER_PROFILE=
+WEB_AI_HEADLESS=false
+
+# File penyimpanan mode dan pilihan AI per chat.
+AI_MODE_FILE=./ai-modes.json
+AI_SERVICE_FILE=./ai-services.json
+
+# Mode jawaban default.
+AI_MODE=auto
+
+# Session dan retry.
+WEB_AI_SESSION_IDLE_MS=300000
+WEB_AI_MAX_ATTEMPTS=2
+MAX_QUEUE_PER_CHAT=2
+
+# Deteksi jawaban selesai.
+ANSWER_STABLE_INTERVAL_MS=300
+ANSWER_STABLE_CHECKS=2
 ```
 
-Profile default:
+Catatan `BROWSER_PROFILE`:
 
-- Gemini: `./browser-profile-gemini`
-- ChatGPT: `./browser-profile`
-
-Kalau `BROWSER_PROFILE` diisi manual, nilai itu akan dipakai untuk service apa pun. Kalau ingin profile otomatis sesuai service, kosongkan `BROWSER_PROFILE`.
+- Kosongkan `BROWSER_PROFILE` untuk memakai profile otomatis.
+- Gemini otomatis memakai `./browser-profile-gemini`.
+- ChatGPT otomatis memakai `./browser-profile`.
+- Jika `BROWSER_PROFILE` diisi manual, Gemini dan ChatGPT akan memakai profile yang sama. Ini tidak disarankan untuk bot yang bisa switch per chat.
 
 ## Login WhatsApp
 
-Saat bot pertama kali start, bot akan meminta pairing code jika session belum ada. Gunakan nomor WhatsApp format internasional tanpa `+`.
+Start bot:
 
-Contoh:
-
-```env
-PAIRING_PHONE_NUMBER=6281234567890
-USE_PAIRING_CODE=true
+```bash
+npm run start:gemini
 ```
 
-Lalu start bot. Masukkan pairing code di WhatsApp:
+Jika session WhatsApp belum ada, bot akan menampilkan pairing code.
+
+Buka WhatsApp di HP:
 
 ```text
 WhatsApp -> Perangkat tertaut -> Tautkan perangkat -> Tautkan dengan nomor telepon
 ```
 
-Session WhatsApp akan tersimpan di `AUTH_DIR`, default-nya `./session`.
+Masukkan pairing code dari terminal. Setelah berhasil, session tersimpan di `./session`.
 
-## Login AI Browser
+## Login Gemini Dan ChatGPT
 
-Ada dua cara login AI:
-
-1. Login lokal, kalau server punya tampilan browser yang bisa dibuka.
-2. Remote login, untuk VPS/headless. Ini yang biasanya dipakai.
+Bot perlu browser profile yang sudah login. Login dilakukan sekali per AI browser, lalu session tersimpan di server.
 
 ### Login Lokal
 
-Gemini:
+Jika server punya GUI atau browser bisa dibuka:
 
 ```bash
 npm run login:gemini
-```
-
-ChatGPT:
-
-```bash
 npm run login:chatgpt
 ```
 
-Setelah halaman AI terbuka, login sampai halaman chat bisa dipakai. Lalu tekan `ENTER` di terminal untuk menyimpan session.
+Login sampai halaman chat AI terbuka, lalu tekan `ENTER` di terminal script login.
 
 ### Remote Login Dari HP
 
-Untuk VPS, jangan mengandalkan URL `http://IP-VPS:8787`. Login Gemini/ChatGPT sering bermasalah lewat IP VPS langsung, terutama karena origin tidak HTTPS, firewall, atau proteksi login web AI.
+Untuk VPS/headless:
 
-Pakai domain HTTPS dari tunnel/public preview, seperti:
+```bash
+npm run remote-login:gemini
+npm run remote-login:chatgpt
+```
+
+Script membuka browser di VPS dan panel remote di port `8787`. Panel ini menampilkan screenshot browser, lalu HP mengirim click dan text input ke browser VPS.
+
+Gunakan URL HTTPS dari tunnel/public preview, bukan IP VPS mentah, misalnya:
 
 ```text
 https://subdomain.lhr.life/?token=<token>
 ```
 
-Contoh bentuk URL:
-
-```text
-https://b1a308a406f358.lhr.life/?token=xxxxxxxxxxxxxxxxxxxxxxxx
-```
-
-URL di atas hanya contoh. Pakai URL domain HTTPS yang muncul dari tunnel/session kamu sendiri.
-
-Jalankan remote login Gemini:
+Jika ingin terminal menampilkan URL public:
 
 ```bash
-npm run remote-login:gemini
+REMOTE_LOGIN_PUBLIC_URL="https://subdomain.lhr.life" npm run remote-login:gemini
 ```
 
-Jalankan remote login ChatGPT:
-
-```bash
-npm run remote-login:chatgpt
-```
-
-Script akan membuka browser di VPS dan menyediakan panel remote di port `8787`. Panel itu menampilkan screenshot browser, lalu HP mengirim click dan text input ke browser VPS.
-
-Alur login remote:
+Alur remote login:
 
 1. Jalankan `npm run remote-login:gemini` atau `npm run remote-login:chatgpt`.
-2. Buka URL domain HTTPS tunnel dari HP, bukan IP VPS mentah.
-3. URL harus membawa query `token`, contoh `?token=...`.
-4. Tap field email/password di screenshot.
-5. Ketik email/password/kode OTP di textarea panel.
-6. Tekan `Send Text`, `Send + Enter`, atau tombol keyboard lain sesuai kebutuhan.
-7. Tunggu sampai halaman chat Gemini/ChatGPT terbuka.
-8. Tekan tombol `Done` di panel.
-9. Browser profile akan tersimpan di server.
+2. Buka URL HTTPS yang membawa query `?token=...`.
+3. Tap field email/password di screenshot.
+4. Ketik email/password/kode OTP di textarea panel.
+5. Pakai tombol `Send Text`, `Send + Enter`, atau tombol keyboard lain.
+6. Tunggu sampai halaman chat Gemini/ChatGPT terbuka.
+7. Tekan `Done` di panel.
 
-Kalau ingin log script menampilkan URL domain langsung, set:
+Catatan:
 
-```bash
-REMOTE_LOGIN_PUBLIC_URL="https://subdomain.lhr.life" npm run remote-login:chatgpt
-```
+- Token remote login dibuat random setiap run, kecuali `REMOTE_LOGIN_TOKEN` diisi.
+- Jangan share URL remote login.
+- Jika session AI expired, ulangi login untuk AI tersebut.
 
-Nanti buka:
+## ChatGPT Cookie Opsional
 
-```text
-https://subdomain.lhr.life/?token=<token-yang-muncul-di-terminal>
-```
-
-Catatan penting:
-
-- Token remote login dibuat random setiap run, kecuali `REMOTE_LOGIN_TOKEN` diset manual.
-- Jangan share URL remote login ke orang lain.
-- Setelah login selesai, tutup remote login dengan tombol `Done`.
-- Jika session AI expired, ulangi remote login.
-
-## ChatGPT Cookie
-
-ChatGPT tidak wajib memakai `cookie.js`.
-
-Cara utama yang disarankan:
+ChatGPT tidak wajib memakai `cookie.js`. Cara utama yang disarankan adalah login manual:
 
 ```bash
 npm run login:chatgpt
 ```
 
-atau di VPS:
+atau:
 
 ```bash
 npm run remote-login:chatgpt
 ```
 
-Session login akan tersimpan di `./browser-profile`.
-
-`cookie.js` hanya opsi cadangan kalau sudah punya export cookie ChatGPT. Jika ingin import cookie:
+Jika sudah punya export cookie ChatGPT:
 
 ```bash
 npm run import:cookies
 ```
 
-Saat service ChatGPT aktif, bot akan mencoba load `cookie.js` kalau file itu ada. Kalau file tidak ada, bot tetap lanjut memakai browser profile manual login.
+Saat ChatGPT dipakai, bot mencoba load `cookie.js` jika file ada. Jika tidak ada, bot tetap memakai browser profile manual login.
 
 ## Start Bot
 
@@ -259,7 +249,7 @@ Langsung ChatGPT:
 npm run start:chatgpt
 ```
 
-Atau pakai environment:
+Dengan environment:
 
 ```bash
 WEB_AI_SERVICE=gemini npm start
@@ -287,41 +277,100 @@ pm2 list
 pm2 logs whatsapp-ai-bot-gemini
 ```
 
-Switch dari ChatGPT ke Gemini:
+Restart setelah update kode:
 
 ```bash
-pm2 stop whatsapp-ai-bot-chatgpt
-pm2 start npm --name whatsapp-ai-bot-gemini -- run start:gemini
+pm2 restart whatsapp-ai-bot-gemini
 ```
 
-Switch dari Gemini ke ChatGPT:
+Stop bot:
 
 ```bash
 pm2 stop whatsapp-ai-bot-gemini
-pm2 start npm --name whatsapp-ai-bot-chatgpt -- run start:chatgpt
 ```
 
 Jangan jalankan dua proses untuk nomor WhatsApp yang sama secara bersamaan.
 
 ## Cara Pakai Di WhatsApp
 
-Private chat:
+### Private Chat
+
+Di private chat, kirim pertanyaan langsung:
 
 ```text
-Tanya langsung tanpa prefix
+buatkan caption promosi produk kopi
 ```
 
-Group:
+Command tetap memakai prefix `.ai`:
 
 ```text
-.ai tulis ringkasan singkat tentang DNS
+.ai status
+.ai mode chatgpt
 ```
 
-Kalau `.ai` dikirim tanpa pertanyaan, bot akan menampilkan bantuan mode.
+### Group
+
+Di group, pertanyaan harus memakai prefix `.ai`:
+
+```text
+.ai ringkas artikel ini jadi 5 poin
+```
+
+Jika `.ai` dikirim tanpa pertanyaan, bot menampilkan bantuan mode dan switch AI.
+
+## Command WhatsApp
+
+Cek status chat dan bot:
+
+```text
+.ai status
+```
+
+Status berisi:
+
+- AI browser chat ini.
+- Default AI browser.
+- Mode chat ini.
+- Status browser AI.
+- Jumlah session aktif.
+- Antrean chat ini.
+- Antrean total.
+- Jumlah retry otomatis.
+
+Switch AI browser untuk chat saat ini:
+
+```text
+.ai mode gemini
+.ai mode chatgpt
+```
+
+Alias typo yang diterima:
+
+```text
+.ai modr gemini
+.ai modr chatgpt
+```
+
+Balikkan chat ke AI default:
+
+```text
+.ai mode default
+```
+
+Ubah default untuk semua chat yang belum punya pilihan sendiri:
+
+```text
+.ai mode global gemini
+.ai mode global chatgpt
+```
+
+Pilihan AI browser disimpan di `ai-services.json`, jadi tetap berlaku setelah PM2 restart.
 
 ## Mode Jawaban
 
-Mode disimpan per chat. Command:
+Mode disimpan per chat di `ai-modes.json`.
+
+Command:
 
 ```text
 .ai mode
@@ -335,21 +384,50 @@ Mode disimpan per chat. Command:
 
 Gemini:
 
+- `auto`: bot memilih mode dari isi pertanyaan.
 - `cepat` atau `instant`: mode cepat untuk respons ringan.
 - `penalaran` atau `thinking`: mode reasoning/penalaran.
 - `pro`: mode Gemini Pro untuk pertanyaan berat.
-- `auto`: bot memilih mode dari isi pertanyaan.
 
 ChatGPT:
 
+- `auto`: bot memilih `instant` atau `thinking`.
 - `instant`: GPT-5.3 Instant.
 - `thinking`: GPT-5.5 Thinking.
 - `cepat`: alias ke `instant`.
 - `penalaran`: alias ke `thinking`.
 - `pro`: diarahkan ke `thinking`, karena ChatGPT di bot ini hanya memakai dua mode.
-- `auto`: bot memilih `instant` atau `thinking`.
 
-## Cek Session
+## Antrean Dan Retry
+
+`MAX_QUEUE_PER_CHAT` membatasi jumlah pesan yang boleh menunggu per chat. Default:
+
+```env
+MAX_QUEUE_PER_CHAT=2
+```
+
+Jika chat mengirim terlalu banyak pertanyaan saat bot masih memproses, bot akan membalas bahwa antrean chat penuh.
+
+`WEB_AI_MAX_ATTEMPTS` mengatur retry saat AI web timeout atau selector tidak muncul. Default:
+
+```env
+WEB_AI_MAX_ATTEMPTS=2
+```
+
+Saat retry, bot mengirim pesan singkat bahwa browser AI lambat atau macet, lalu reload browser AI tersebut dan mencoba lagi.
+
+## File Runtime Yang Dibuat Bot
+
+- `session/`: session WhatsApp Baileys.
+- `browser-profile-gemini/`: login Gemini.
+- `browser-profile/`: login ChatGPT.
+- `ai-modes.json`: mode jawaban per chat.
+- `ai-services.json`: pilihan Gemini/ChatGPT per chat dan default.
+- `cookie.js`: cookie ChatGPT opsional.
+
+File-file ini sensitif dan sudah masuk `.gitignore`.
+
+## Cek Session AI
 
 Cek Gemini:
 
@@ -363,121 +441,149 @@ Cek ChatGPT:
 npm run check:chatgpt:xvfb
 ```
 
-Kalau check gagal karena login expired, ulangi login AI browser.
+Jika check gagal karena login expired, ulangi login AI browser.
+
+## Test Dan Validasi
+
+Syntax check dan test bawaan:
+
+```bash
+npm test
+```
+
+Check `index.js` saja:
+
+```bash
+node --check index.js
+```
 
 ## Troubleshooting
 
-### Remote Login Tidak Bisa Dibuka Dari HP
-
-Jangan pakai `http://IP-VPS:8787` kalau gagal. Pakai domain HTTPS dari tunnel/public preview, misalnya:
-
-```text
-https://subdomain.lhr.life/?token=<token>
-```
-
-Pastikan:
-
-- Remote login script masih berjalan.
-- URL membawa query `token`.
-- Domain HTTPS mengarah ke port remote login `8787`.
-- Firewall VPS tidak memblokir port jika memang memakai akses langsung.
-
-### ChatGPT Masuk Halaman Login Lagi
-
-Session `./browser-profile` expired. Jalankan:
-
-```bash
-npm run remote-login:chatgpt
-```
-
-Login ulang sampai halaman chat terbuka, lalu tekan `Done`.
-
-### Gemini Masuk Halaman Login Lagi
-
-Session `./browser-profile-gemini` expired. Jalankan:
-
-```bash
-npm run remote-login:gemini
-```
-
-### ChatGPT Berhenti Di `Just a moment...`
-
-Tunggu beberapa saat. Kalau tetap berhenti, login ulang manual/remote sampai halaman chat terbuka. Cookie tidak wajib, tapi jika memakai cookie, pastikan cookie belum expired dan user-agent cocok.
-
-### Mode Tidak Sesuai
-
-Pastikan service yang sedang jalan benar:
-
-```bash
-pm2 logs whatsapp-ai-bot-gemini --lines 30
-pm2 logs whatsapp-ai-bot-chatgpt --lines 30
-```
-
-Log startup akan menampilkan:
-
-```text
-Mode AI browser: Gemini
-```
-
-atau:
-
-```text
-Mode AI browser: ChatGPT
-```
-
 ### Bot Lambat Menjawab
 
-Bot ini mengontrol web UI, bukan API. Kecepatan tergantung:
+Bot ini mengontrol web UI, bukan API. Kecepatan tergantung web Gemini/ChatGPT, koneksi VPS, kondisi browser profile, panjang jawaban, dan mode yang dipilih.
 
-- kecepatan web Gemini/ChatGPT,
-- kondisi browser profile,
-- koneksi VPS,
-- panjang konteks chat,
-- mode yang dipilih.
-
-Untuk respons cepat, pakai:
+Untuk respons cepat:
 
 ```text
 .ai mode cepat
 ```
 
-di Gemini, atau:
+atau saat ChatGPT:
 
 ```text
 .ai mode instant
 ```
 
-di ChatGPT.
+### ChatGPT Atau Gemini Login Expired
+
+Login ulang AI yang bermasalah:
+
+```bash
+npm run remote-login:gemini
+npm run remote-login:chatgpt
+```
+
+### ChatGPT Berhenti Di `Just a moment...`
+
+Tunggu beberapa saat. Jika tetap berhenti, login ulang manual/remote sampai halaman chat terbuka. Cookie tidak wajib, tapi jika memakai cookie, pastikan cookie belum expired dan user-agent cocok.
+
+### Remote Login Tidak Bisa Dibuka Dari HP
+
+Jangan pakai `http://IP-VPS:8787` jika gagal. Pakai domain HTTPS dari tunnel/public preview.
+
+Pastikan:
+
+- Script remote login masih berjalan.
+- URL membawa query `token`.
+- Domain HTTPS mengarah ke port `8787`.
+- Firewall VPS tidak memblokir port jika memakai akses langsung.
+
+### Mode Atau AI Tidak Sesuai
+
+Cek dari WhatsApp:
+
+```text
+.ai status
+```
+
+Cek log PM2:
+
+```bash
+pm2 logs whatsapp-ai-bot-gemini --lines 50
+```
+
+### Reset Pilihan AI Chat
+
+Jika chat terlanjur dipaksa ke Gemini/ChatGPT dan ingin ikut default lagi:
+
+```text
+.ai mode default
+```
+
+### Bersihkan Session
+
+Hanya lakukan jika memang ingin login ulang.
+
+WhatsApp:
+
+```bash
+pm2 stop whatsapp-ai-bot-gemini
+mv session session.backup
+npm run start:gemini
+```
+
+Gemini:
+
+```bash
+pm2 stop whatsapp-ai-bot-gemini
+mv browser-profile-gemini browser-profile-gemini.backup
+npm run remote-login:gemini
+```
+
+ChatGPT:
+
+```bash
+pm2 stop whatsapp-ai-bot-gemini
+mv browser-profile browser-profile.backup
+npm run remote-login:chatgpt
+```
 
 ## Backup
 
-Backup source dan session bisa dibuat dengan `tar`. Jangan upload hasil backup ke GitHub karena berisi session login.
-
-Contoh backup lokal:
+Backup lokal:
 
 ```bash
+mkdir -p backups
 tar --exclude=./node_modules --exclude=./backups --exclude=./.git-data -czf backups/ai-backup.tgz .
 ```
+
+Jangan upload backup ke GitHub karena berisi session login.
 
 ## Publish Ke GitHub
 
 Yang aman di-commit:
 
-- source code,
-- `package.json`,
-- `package-lock.json`,
-- `.env.example`,
-- README,
-- test dan script.
+- Source code.
+- `package.json`.
+- `package-lock.json`.
+- `.env.example`.
+- `.gitignore`.
+- README.
+- Folder `src/`, `scripts/`, dan `test/`.
 
 Yang tidak boleh di-commit:
 
-- `.env`,
-- `cookie.js`,
-- `session/`,
-- `browser-profile/`,
-- `browser-profile-gemini/`,
-- backup.
+- `.env`
+- `cookie.js`
+- `ai-modes.json`
+- `ai-services.json`
+- `session/`
+- `auth_info_baileys*/`
+- `browser-profile/`
+- `browser-profile-gemini/`
+- `backups/`
+- `node_modules/`
 
 Sebelum push:
 
@@ -485,15 +591,3 @@ Sebelum push:
 git status
 git diff --cached --name-only
 ```
-
-Pastikan file rahasia tidak muncul di daftar commit.
-
-## Test
-
-Jalankan:
-
-```bash
-npm test
-```
-
-Test ini melakukan syntax check file utama dan menjalankan unit test yang tersedia.

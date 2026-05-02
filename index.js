@@ -23,12 +23,15 @@ const WA_AUTH_DIR = process.env.AUTH_DIR || './session';
 const DEFAULT_WEB_AI_SERVICE = 'gemini';
 const WEB_AI_SERVICE_ARG = IS_MAIN_MODULE ? process.argv[2] || '' : '';
 const CHATGPT_USER_AGENT = process.env.CHATGPT_USER_AGENT || '';
-let webAiService = normalizeWebAiService(WEB_AI_SERVICE_ARG || process.env.WEB_AI_SERVICE || DEFAULT_WEB_AI_SERVICE);
-let browserProfile = resolveBrowserProfile(webAiService);
-let browserUserAgent = resolveBrowserUserAgent(webAiService);
 const CHATGPT_COOKIE_FILE = process.env.CHATGPT_COOKIE_FILE || './cookie.js';
 const AI_MODE_FILE = process.env.AI_MODE_FILE || './ai-modes.json';
+const AI_SERVICE_FILE = process.env.AI_SERVICE_FILE || './ai-services.json';
 const WA_ALLOWED = [];
+const savedAiServices = loadAiServices();
+let webAiService = savedAiServices.defaultService ||
+  normalizeWebAiService(WEB_AI_SERVICE_ARG || process.env.WEB_AI_SERVICE || DEFAULT_WEB_AI_SERVICE);
+let browserProfile = resolveBrowserProfile(webAiService);
+let browserUserAgent = resolveBrowserUserAgent(webAiService);
 
 const CHATGPT_URL = 'https://chatgpt.com';
 const GEMINI_URL = 'https://gemini.google.com/app';
@@ -37,7 +40,16 @@ const PAIRING_CODE_DELAY_MS = 3000;
 const SELECTOR_TIMEOUT_MS = 45_000;
 const ANSWER_START_TIMEOUT_MS = 60_000;
 const ANSWER_DONE_TIMEOUT_MS = 180_000;
-const MAX_CHATGPT_ATTEMPTS = 2;
+const ANSWER_STABLE_INTERVAL_MS = Math.max(
+  150,
+  Number.parseInt(process.env.ANSWER_STABLE_INTERVAL_MS || '', 10) || 300
+);
+const ANSWER_STABLE_CHECKS = Math.max(1, Number.parseInt(process.env.ANSWER_STABLE_CHECKS || '', 10) || 2);
+const MAX_WEB_AI_ATTEMPTS = Math.max(
+  1,
+  Number.parseInt(process.env.WEB_AI_MAX_ATTEMPTS || process.env.MAX_CHATGPT_ATTEMPTS || '', 10) || 2
+);
+const MAX_QUEUE_PER_CHAT = Math.max(1, Number.parseInt(process.env.MAX_QUEUE_PER_CHAT || '', 10) || 2);
 const WEB_AI_SESSION_IDLE_MS = Math.max(
   60_000,
   Number.parseInt(process.env.WEB_AI_SESSION_IDLE_MS || '', 10) || 5 * 60_000
@@ -49,18 +61,15 @@ const USE_PAIRING_CODE = !['0', 'false', 'no', 'off'].includes(
 );
 const PAIRING_PHONE_NUMBER = process.env.PAIRING_PHONE_NUMBER || '';
 
-let webAiContext = null;
-let webAiPage = null;
-let webAiInitPromise = null;
-let webAiWarmupPromise = null;
-let webAiWarmPage = null;
 let waSock = null;
 let reconnectTimer = null;
 const queue = [];
 let isProcessingQueue = false;
 let sigintRegistered = false;
 const handledMessageIds = new Set();
-const webAiSessions = new Map();
+const webAiStates = new Map();
+const queueCountsBySession = new Map();
+const chatServices = savedAiServices.chatServices;
 const chatModes = loadChatModes();
 
 const AI_MODES = Object.freeze({
@@ -99,6 +108,17 @@ const CHATGPT_MODE_OPTION_TESTIDS = Object.freeze({
   instant: 'model-switcher-gpt-5-3',
   thinking: 'model-switcher-gpt-5-5-thinking'
 });
+const GENERATION_BUSY_SELECTORS = [
+  '[data-testid="stop-button"]',
+  'button[aria-label*="Stop" i]',
+  'button[aria-label*="Cancel" i]',
+  'button[aria-label*="Berhenti" i]',
+  'button[aria-label*="Hentikan" i]',
+  'button:has(mat-icon:has-text("stop"))',
+  '[aria-busy="true"]',
+  '[data-is-streaming="true"]',
+  '[data-streaming="true"]'
+];
 
 const DEFAULT_AI_MODE = normalizeAiMode(process.env.AI_MODE || 'auto') || 'auto';
 
@@ -227,7 +247,7 @@ async function handleBaileysMessage({ sock, message }) {
 
   const isGroup = jid.endsWith('@g.us');
   const body = extractText(message);
-  const commandReply = handleAiCommand({ jid, body, isGroup });
+  const commandReply = await handleAiCommand({ jid, body, isGroup, message });
   if (commandReply) {
     await sendLongText(sock, jid, commandReply, message);
     return;
@@ -241,17 +261,34 @@ async function handleBaileysMessage({ sock, message }) {
     return;
   }
 
-  console.log(`AI request from ${isGroup ? 'group' : 'private'} ${stripWhatsAppSuffix(jid)}.`);
-  await sock.readMessages([message.key]).catch(() => {});
-  await sock.sendPresenceUpdate('composing', jid).catch(() => {});
-  await reactToMessage(sock, jid, message, '⏳');
+  const aiSessionKey = getAiSessionKey({ jid, message, isGroup });
+  const service = getConfiguredService(jid);
+  const queuedForChat = getQueueCount(aiSessionKey);
+  if (queuedForChat >= MAX_QUEUE_PER_CHAT) {
+    await sendLongText(
+      sock,
+      jid,
+      `Antrean chat ini masih penuh (${queuedForChat}/${MAX_QUEUE_PER_CHAT}). Tunggu balasan sebelumnya selesai, lalu kirim lagi.`,
+      message
+    );
+    return;
+  }
 
+  console.log(`AI request from ${isGroup ? 'group' : 'private'} ${stripWhatsAppSuffix(jid)} via ${getWebAiLabel(service)}.`);
+  await Promise.allSettled([
+    sock.readMessages([message.key]),
+    sock.sendPresenceUpdate('composing', jid),
+    reactToMessage(sock, jid, message, '⏳')
+  ]);
+
+  incrementQueueCount(aiSessionKey);
   queue.push({
     sock,
     jid,
     quotedMessage: message,
     question,
-    aiSessionKey: getAiSessionKey({ jid, message, isGroup })
+    aiSessionKey,
+    service
   });
   processQueue().catch((error) => {
     console.error('Queue processor crashed:', error);
@@ -264,17 +301,34 @@ async function processQueue() {
 
   try {
     while (queue.length > 0) {
-      const { sock, jid, quotedMessage, question, aiSessionKey } = queue.shift();
+      const { sock, jid, quotedMessage, question, aiSessionKey, service } = queue.shift();
       const activeSock = waSock || sock;
+      let retryNoticeSent = false;
 
       try {
-        const answer = await askWebAi(question, { jid, sessionKey: aiSessionKey });
-        await sendLongText(activeSock, jid, answer || `${getWebAiLabel()} tidak mengembalikan jawaban.`, quotedMessage);
-        await reactToMessage(activeSock, jid, quotedMessage, '✅');
+        const answer = await askWebAi(question, {
+          jid,
+          sessionKey: aiSessionKey,
+          service,
+          onRetry: async () => {
+            if (retryNoticeSent) return;
+            retryNoticeSent = true;
+            await sendLongText(
+              activeSock,
+              jid,
+              `${getWebAiLabel(service)} lambat atau macet. Saya reload browser lalu coba sekali lagi.`,
+              quotedMessage
+            );
+          }
+        });
+        await sendLongText(activeSock, jid, answer || `${getWebAiLabel(service)} tidak mengembalikan jawaban.`, quotedMessage);
+        reactToMessage(activeSock, jid, quotedMessage, '✅');
       } catch (error) {
         console.error('Failed to answer message:', error);
-        await sendLongText(activeSock, jid, formatWhatsAppError(error), quotedMessage);
-        await reactToMessage(activeSock, jid, quotedMessage, '❌');
+        await sendLongText(activeSock, jid, formatWhatsAppError(error, service), quotedMessage);
+        reactToMessage(activeSock, jid, quotedMessage, '❌');
+      } finally {
+        decrementQueueCount(aiSessionKey);
       }
     }
   } finally {
@@ -286,30 +340,35 @@ export async function askChatGPT(question) {
   return askWebAi(question);
 }
 
-export async function askWebAi(question, { jid = 'default', sessionKey = jid } = {}) {
+export async function askWebAi(
+  question,
+  { jid = 'default', sessionKey = jid, service = getConfiguredService(jid), onRetry = null } = {}
+) {
   let lastError = null;
-  const mode = resolveModeForQuestion(jid, question);
+  const aiService = normalizeWebAiService(service);
+  const mode = resolveModeForQuestion(jid, question, aiService);
   const aiSessionKey = normalizeAiSessionKey(sessionKey || jid);
 
-  for (let attempt = 1; attempt <= MAX_CHATGPT_ATTEMPTS; attempt += 1) {
+  for (let attempt = 1; attempt <= MAX_WEB_AI_ATTEMPTS; attempt += 1) {
     try {
-      const page = await getWebAiPage(aiSessionKey);
-      if (webAiService === 'gemini') return await askGeminiOnPage(page, question, mode);
+      const page = await getWebAiPage(aiService, aiSessionKey);
+      if (aiService === 'gemini') return await askGeminiOnPage(page, question, mode);
       const prompt = buildModePrompt(question, mode);
       return await askChatGPTOnPage(page, prompt, mode);
     } catch (error) {
       lastError = error;
 
-      if (attempt < MAX_CHATGPT_ATTEMPTS && shouldRetryChatGPT(error)) {
-        await resetWebAiBrowser();
+      if (attempt < MAX_WEB_AI_ATTEMPTS && shouldRetryWebAi(error)) {
+        await onRetry?.({ attempt, error, service: aiService });
+        await resetWebAiBrowser(aiService);
         continue;
       }
 
       throw error;
     }
     finally {
-      if (webAiService === 'gemini') {
-        releaseWebAiSession(aiSessionKey);
+      if (aiService === 'gemini') {
+        releaseWebAiSession(aiService, aiSessionKey);
       }
     }
   }
@@ -317,93 +376,108 @@ export async function askWebAi(question, { jid = 'default', sessionKey = jid } =
   throw lastError;
 }
 
-async function getWebAiPage(sessionKey = 'default') {
-  if (webAiService === 'gemini') {
-    return getGeminiSessionPage(sessionKey);
+async function getWebAiPage(service, sessionKey = 'default') {
+  const aiService = normalizeWebAiService(service);
+  if (aiService === 'gemini') {
+    return getGeminiSessionPage(aiService, sessionKey);
   }
 
-  return getSharedWebAiPage();
+  return getSharedWebAiPage(aiService);
 }
 
-async function getSharedWebAiPage() {
-  if (!webAiContext && webAiInitPromise) {
-    return webAiInitPromise;
+async function getSharedWebAiPage(service) {
+  const state = getWebAiState(service);
+  if (!state.context && state.initPromise) {
+    return state.initPromise;
   }
 
-  if (!webAiContext) {
-    webAiInitPromise = launchWebAiPage();
+  if (!state.context) {
+    const initPromise = launchWebAiPage(service);
+    state.initPromise = initPromise;
     try {
-      return await webAiInitPromise;
+      return await initPromise;
     } finally {
-      webAiInitPromise = null;
+      if (state.initPromise === initPromise) state.initPromise = null;
     }
   }
 
-  if (!webAiPage || webAiPage.isClosed()) {
-    webAiPage = webAiContext.pages()[0] || (await webAiContext.newPage());
+  if (!state.page || state.page.isClosed()) {
+    state.page = state.context.pages()[0] || (await state.context.newPage());
   }
 
-  return webAiPage;
+  return state.page;
 }
 
-async function getWebAiContext() {
-  if (!webAiContext && webAiInitPromise) {
-    await webAiInitPromise;
+async function getWebAiContext(service) {
+  const state = getWebAiState(service);
+  if (!state.context && state.initPromise) {
+    await state.initPromise;
   }
 
-  if (!webAiContext) {
-    webAiInitPromise = launchWebAiPage();
+  if (!state.context) {
+    const initPromise = launchWebAiPage(service);
+    state.initPromise = initPromise;
     try {
-      await webAiInitPromise;
+      await initPromise;
     } finally {
-      webAiInitPromise = null;
+      if (state.initPromise === initPromise) state.initPromise = null;
     }
   }
 
-  return webAiContext;
+  return state.context;
 }
 
-async function launchWebAiPage() {
-  webAiContext = await chromium.launchPersistentContext(browserProfile, {
+async function launchWebAiPage(service) {
+  const aiService = normalizeWebAiService(service);
+  const state = getWebAiState(aiService);
+  state.profile = resolveBrowserProfile(aiService);
+  state.userAgent = resolveBrowserUserAgent(aiService);
+
+  const context = await chromium.launchPersistentContext(state.profile, {
     headless: WEB_AI_HEADLESS,
-    ...getWebAiBrowserOptions(),
-    ...(browserUserAgent ? { userAgent: browserUserAgent } : {}),
+    ...getWebAiBrowserOptions(aiService),
+    ...(state.userAgent ? { userAgent: state.userAgent } : {}),
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled']
   });
 
-  await prepareWebAiContext(webAiContext);
-  if (webAiService === 'chatgpt') {
-    await loadChatGptCookies(webAiContext);
+  state.context = context;
+  await prepareWebAiContext(context);
+  if (aiService === 'chatgpt') {
+    await loadChatGptCookies(context);
   }
 
-  webAiContext.on('close', () => {
-    clearWebAiSessions();
-    webAiContext = null;
-    webAiPage = null;
-    webAiWarmPage = null;
+  context.on('close', () => {
+    clearWebAiSessions(aiService);
+    if (state.context === context) {
+      state.context = null;
+      state.page = null;
+      state.warmPage = null;
+    }
   });
 
-  webAiPage = webAiContext.pages()[0] || (await webAiContext.newPage());
-  return webAiPage;
+  state.page = context.pages()[0] || (await context.newPage());
+  return state.page;
 }
 
-async function getWarmWebAiPage() {
-  await getWebAiContext();
+async function getWarmWebAiPage(service) {
+  const state = getWebAiState(service);
+  await getWebAiContext(service);
 
-  if (!webAiWarmPage || webAiWarmPage.isClosed()) {
-    webAiWarmPage = webAiPage && !webAiPage.isClosed() ? webAiPage : await webAiContext.newPage();
+  if (!state.warmPage || state.warmPage.isClosed()) {
+    state.warmPage = state.page && !state.page.isClosed() ? state.page : await state.context.newPage();
   }
 
-  return webAiWarmPage;
+  return state.warmPage;
 }
 
-async function getGeminiSessionPage(sessionKey) {
+async function getGeminiSessionPage(service, sessionKey) {
+  const state = getWebAiState(service);
   const normalizedKey = normalizeAiSessionKey(sessionKey);
-  let session = webAiSessions.get(normalizedKey);
+  let session = state.sessions.get(normalizedKey);
 
   if (session?.page?.isClosed()) {
     clearTimeout(session.cleanupTimer);
-    webAiSessions.delete(normalizedKey);
+    state.sessions.delete(normalizedKey);
     session = null;
   }
 
@@ -413,18 +487,18 @@ async function getGeminiSessionPage(sessionKey) {
     return session.page;
   }
 
-  if (webAiWarmupPromise) {
-    await webAiWarmupPromise.catch(() => {});
+  if (state.warmupPromise) {
+    await state.warmupPromise.catch(() => {});
   }
 
-  await getWebAiContext();
+  await getWebAiContext(service);
 
   let page = null;
-  if (webAiWarmPage && !webAiWarmPage.isClosed()) {
-    page = webAiWarmPage;
-    webAiWarmPage = null;
+  if (state.warmPage && !state.warmPage.isClosed()) {
+    page = state.warmPage;
+    state.warmPage = null;
   } else {
-    page = await webAiContext.newPage();
+    page = await state.context.newPage();
   }
 
   session = {
@@ -433,56 +507,62 @@ async function getGeminiSessionPage(sessionKey) {
     lastUsedAt: Date.now(),
     cleanupTimer: null
   };
-  webAiSessions.set(normalizedKey, session);
-  console.log(`Opened ${getWebAiLabel()} session. Active sessions: ${webAiSessions.size}.`);
+  state.sessions.set(normalizedKey, session);
+  console.log(`Opened ${getWebAiLabel(service)} session. Active sessions: ${state.sessions.size}.`);
   return page;
 }
 
-function releaseWebAiSession(sessionKey) {
-  const session = webAiSessions.get(normalizeAiSessionKey(sessionKey));
+function releaseWebAiSession(service, sessionKey) {
+  const state = getWebAiState(service);
+  const session = state.sessions.get(normalizeAiSessionKey(sessionKey));
   if (!session) return;
 
   session.busy = false;
   session.lastUsedAt = Date.now();
   clearTimeout(session.cleanupTimer);
   session.cleanupTimer = setTimeout(() => {
-    closeIdleWebAiSession(sessionKey).catch((error) => {
-      console.warn(`Gagal menutup session idle ${getWebAiLabel()}: ${error.message}`);
+    closeIdleWebAiSession(service, sessionKey).catch((error) => {
+      console.warn(`Gagal menutup session idle ${getWebAiLabel(service)}: ${error.message}`);
     });
   }, WEB_AI_SESSION_IDLE_MS);
   session.cleanupTimer.unref?.();
 }
 
-async function closeIdleWebAiSession(sessionKey) {
+async function closeIdleWebAiSession(service, sessionKey) {
+  const state = getWebAiState(service);
   const normalizedKey = normalizeAiSessionKey(sessionKey);
-  const session = webAiSessions.get(normalizedKey);
+  const session = state.sessions.get(normalizedKey);
   if (!session || session.busy) return;
 
   if (Date.now() - session.lastUsedAt < WEB_AI_SESSION_IDLE_MS) {
-    releaseWebAiSession(normalizedKey);
+    releaseWebAiSession(service, normalizedKey);
     return;
   }
 
-  webAiSessions.delete(normalizedKey);
+  state.sessions.delete(normalizedKey);
   clearTimeout(session.cleanupTimer);
   await session.page?.close?.().catch(() => {});
-  console.log(`Closed idle ${getWebAiLabel()} session. Active sessions: ${webAiSessions.size}.`);
+  console.log(`Closed idle ${getWebAiLabel(service)} session. Active sessions: ${state.sessions.size}.`);
 }
 
-function clearWebAiSessions() {
-  for (const session of webAiSessions.values()) {
+function clearWebAiSessions(service) {
+  const state = getWebAiState(service);
+  for (const session of state.sessions.values()) {
     clearTimeout(session.cleanupTimer);
   }
-  webAiSessions.clear();
+  state.sessions.clear();
 }
 
-function warmWebAiBrowser() {
-  if (webAiWarmupPromise) return webAiWarmupPromise;
+function warmWebAiBrowser(service = webAiService) {
+  const warmupService = normalizeWebAiService(service);
+  const state = getWebAiState(warmupService);
+  if (state.warmupPromise) return state.warmupPromise;
 
-  webAiWarmupPromise = (async () => {
-    const page = webAiService === 'gemini' ? await getWarmWebAiPage() : await getSharedWebAiPage();
+  const warmupLabel = getWebAiLabel(warmupService);
+  const warmupPromise = (async () => {
+    const page = warmupService === 'gemini' ? await getWarmWebAiPage(warmupService) : await getSharedWebAiPage(warmupService);
 
-    if (webAiService === 'gemini') {
+    if (warmupService === 'gemini') {
       await ensureGeminiPageReady(page);
       await findGeminiPrompt(page);
     } else {
@@ -494,16 +574,44 @@ function warmWebAiBrowser() {
       await findChatGptPrompt(page);
     }
 
-    console.log(`${getWebAiLabel()} browser ready.`);
+    console.log(`${warmupLabel} browser ready.`);
   })()
     .catch((error) => {
-      console.warn(`Gagal warmup ${getWebAiLabel()}: ${error.message}`);
+      console.warn(`Gagal warmup ${warmupLabel}: ${error.message}`);
     })
     .finally(() => {
-      webAiWarmupPromise = null;
+      if (state.warmupPromise === warmupPromise) {
+        state.warmupPromise = null;
+      }
     });
 
-  return webAiWarmupPromise;
+  state.warmupPromise = warmupPromise;
+  return warmupPromise;
+}
+
+function getWebAiState(service = webAiService) {
+  const aiService = normalizeWebAiService(service);
+  let state = webAiStates.get(aiService);
+  if (!state) {
+    state = {
+      service: aiService,
+      context: null,
+      page: null,
+      initPromise: null,
+      warmupPromise: null,
+      warmPage: null,
+      sessions: new Map(),
+      profile: resolveBrowserProfile(aiService),
+      userAgent: resolveBrowserUserAgent(aiService)
+    };
+    webAiStates.set(aiService, state);
+  }
+
+  return state;
+}
+
+function getKnownWebAiServices() {
+  return [...new Set([webAiService, ...chatServices.values(), ...webAiStates.keys(), 'gemini', 'chatgpt'])];
 }
 
 async function prepareWebAiContext(context) {
@@ -514,8 +622,9 @@ async function prepareWebAiContext(context) {
   });
 }
 
-function getWebAiBrowserOptions() {
-  if (/android|mobile/i.test(browserUserAgent)) {
+function getWebAiBrowserOptions(service = webAiService) {
+  const userAgent = resolveBrowserUserAgent(service);
+  if (/android|mobile/i.test(userAgent)) {
     return {
       viewport: { width: 393, height: 851 },
       deviceScaleFactor: 2.75,
@@ -553,7 +662,7 @@ async function askChatGPTOnPage(page, question, mode) {
     '[data-message-author-role="assistant"]',
     SELECTOR_TIMEOUT_MS
   );
-  await waitForAssistantTextStable(page, assistantMessages.last(), mode === 'instant' ? 1 : 2);
+  await waitForAssistantTextStable(page, assistantMessages.last(), mode === 'instant' ? 1 : ANSWER_STABLE_CHECKS);
 
   const answer = (await assistantMessages.last().innerText({ timeout: SELECTOR_TIMEOUT_MS })).trim();
   if (!answer) {
@@ -589,7 +698,7 @@ async function askGeminiOnPage(page, question, mode) {
   await submitGeminiPrompt(page);
 
   const response = await waitForGeminiResponse(page, responseLocators, beforeCounts);
-  await waitForAssistantTextStable(page, response);
+  await waitForAssistantTextStable(page, response, mode === 'instant' ? 1 : ANSWER_STABLE_CHECKS);
 
   const answer = (await response.innerText({ timeout: SELECTOR_TIMEOUT_MS })).trim();
   if (!answer) {
@@ -637,7 +746,7 @@ async function findGeminiPrompt(page) {
     }
 
     if (await isGeminiSessionExpired(page)) {
-      throw new SessionExpiredError(`${getWebAiLabel()} session expired.`);
+      throw new SessionExpiredError(`${getWebAiLabel('gemini')} session expired.`);
     }
 
     await delay(500);
@@ -781,7 +890,7 @@ async function waitForGeminiResponse(page, responseLocators, beforeCounts) {
 
   while (Date.now() < deadline) {
     if (await isGeminiSessionExpired(page)) {
-      throw new SessionExpiredError(`${getWebAiLabel()} session expired.`);
+      throw new SessionExpiredError(`${getWebAiLabel('gemini')} session expired.`);
     }
 
     for (let index = 0; index < responseLocators.length; index += 1) {
@@ -1168,21 +1277,19 @@ async function waitForAssistantResponse(page) {
   return assistantMessages;
 }
 
-async function waitForAssistantTextStable(page, locator, stableTarget = 2) {
-  const stopButton = page
-    .locator('[data-testid="stop-button"], button[aria-label*="Stop"]')
-    .first();
-
-  await stopButton.waitFor({ state: 'hidden', timeout: ANSWER_DONE_TIMEOUT_MS }).catch(() => {});
-
+async function waitForAssistantTextStable(page, locator, stableTarget = ANSWER_STABLE_CHECKS) {
   let previous = '';
   let stableCount = 0;
   const deadline = Date.now() + ANSWER_DONE_TIMEOUT_MS;
 
   while (Date.now() < deadline) {
-    const current = (await locator.innerText({ timeout: SELECTOR_TIMEOUT_MS }).catch(() => '')).trim();
+    const [currentText, isBusy] = await Promise.all([
+      locator.innerText({ timeout: Math.max(1000, ANSWER_STABLE_INTERVAL_MS * 2) }).catch(() => ''),
+      isGenerationBusyVisible(page)
+    ]);
+    const current = currentText.trim();
 
-    if (current && current === previous) {
+    if (!isBusy && current && current === previous) {
       stableCount += 1;
       if (stableCount >= Math.max(1, stableTarget)) return;
     } else {
@@ -1190,8 +1297,23 @@ async function waitForAssistantTextStable(page, locator, stableTarget = 2) {
       stableCount = 0;
     }
 
-    await delay(1000);
+    await delay(ANSWER_STABLE_INTERVAL_MS);
   }
+}
+
+async function isGenerationBusyVisible(page) {
+  for (const selector of GENERATION_BUSY_SELECTORS) {
+    const locator = page.locator(selector);
+    const count = Math.min(await locator.count().catch(() => 0), 10);
+
+    for (let index = 0; index < count; index += 1) {
+      if (await locator.nth(index).isVisible({ timeout: 100 }).catch(() => false)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
 
 async function waitForSelectorOrSessionError(page, locator, selector) {
@@ -1229,22 +1351,34 @@ async function isChatGPTSessionExpired(page) {
   return loginButton.isVisible({ timeout: 2_000 }).catch(() => false);
 }
 
-function shouldRetryChatGPT(error) {
+function shouldRetryWebAi(error) {
   return error instanceof SessionExpiredError || error instanceof SelectorTimeoutError || isTimeoutError(error);
 }
 
-async function resetWebAiBrowser() {
-  if (!webAiContext) return;
+async function resetWebAiBrowser(service = webAiService) {
+  const aiService = normalizeWebAiService(service);
+  const state = getWebAiState(aiService);
+  const context = state.context;
 
   try {
-    clearWebAiSessions();
-    await webAiContext.close();
+    clearWebAiSessions(aiService);
+    if (context) {
+      await context.close();
+    }
   } catch (error) {
-    console.error(`Failed to close ${getWebAiLabel()} browser:`, error);
+    console.error(`Failed to close ${getWebAiLabel(aiService)} browser:`, error);
   } finally {
-    webAiContext = null;
-    webAiPage = null;
-    webAiWarmPage = null;
+    state.initPromise = null;
+    state.warmupPromise = null;
+    state.context = null;
+    state.page = null;
+    state.warmPage = null;
+  }
+}
+
+async function resetAllWebAiBrowsers() {
+  for (const service of getKnownWebAiServices()) {
+    await resetWebAiBrowser(service);
   }
 }
 
@@ -1318,7 +1452,26 @@ function normalizeAiSessionKey(value) {
     .slice(0, 300);
 }
 
-function handleAiCommand({ jid, body, isGroup }) {
+function getQueueCount(sessionKey) {
+  return queueCountsBySession.get(normalizeAiSessionKey(sessionKey)) || 0;
+}
+
+function incrementQueueCount(sessionKey) {
+  const key = normalizeAiSessionKey(sessionKey);
+  queueCountsBySession.set(key, getQueueCount(key) + 1);
+}
+
+function decrementQueueCount(sessionKey) {
+  const key = normalizeAiSessionKey(sessionKey);
+  const nextCount = Math.max(0, getQueueCount(key) - 1);
+  if (nextCount === 0) {
+    queueCountsBySession.delete(key);
+  } else {
+    queueCountsBySession.set(key, nextCount);
+  }
+}
+
+async function handleAiCommand({ jid, body, isGroup, message }) {
   const text = String(body || '').trim();
   if (!text.startsWith(PUBLIC_AI_PREFIX)) return '';
 
@@ -1328,26 +1481,90 @@ function handleAiCommand({ jid, body, isGroup }) {
   }
 
   const [command, ...rest] = rawArgs.split(/\s+/);
-  if (!/^mode$/i.test(command)) return '';
+  if (/^(status|info)$/i.test(command)) {
+    return formatAiStatus({ jid, message, isGroup });
+  }
+
+  if (!/^(mode|modr)$/i.test(command)) return '';
 
   const requestedMode = rest.join(' ').trim();
   if (!requestedMode) {
-    return `AI browser: ${getWebAiLabel()}.\nMode AI sekarang: ${getModeDisplayName(getConfiguredMode(jid))}.\n${getModeBehaviorDescription()}\n\n${formatModeList()}`;
+    return formatModeHelp(jid, isGroup);
+  }
+
+  const globalServiceMatch = requestedMode.match(/^(global|semua|all|default)\s+(.+)$/i);
+  if (globalServiceMatch) {
+    const requestedDefaultService = normalizeWebAiSwitchService(globalServiceMatch[2]);
+    if (requestedDefaultService) {
+      return switchDefaultWebAiServiceFromChat(requestedDefaultService);
+    }
+  }
+
+  if (/^(default|bawaan)$/i.test(requestedMode)) {
+    return clearChatWebAiService(jid);
+  }
+
+  const requestedService = normalizeWebAiSwitchService(requestedMode);
+  if (requestedService) {
+    return switchChatWebAiService(jid, requestedService);
   }
 
   const mode = normalizeAiMode(requestedMode);
   if (!mode) {
-    return `Mode tidak dikenal: ${requestedMode}\n\n${formatModeList()}`;
+    return `Mode tidak dikenal: ${requestedMode}\n\n${formatModeList(getConfiguredService(jid))}\n\n${formatServiceSwitchHelp()}`;
   }
 
-  const serviceMode = coerceAiModeForService(mode);
+  const service = getConfiguredService(jid);
+  const serviceMode = coerceAiModeForService(mode, service);
   chatModes.set(jid, serviceMode);
   saveChatModes();
-  return `Mode AI ${getWebAiLabel()} di chat ini diubah ke: ${getModeDisplayName(serviceMode)}.\n${getModeDescription(serviceMode)}`;
+  return `Mode AI ${getWebAiLabel(service)} di chat ini diubah ke: ${getModeDisplayName(serviceMode, service)}.\n${getModeDescription(serviceMode, service)}`;
 }
 
-function getConfiguredMode(jid) {
-  return coerceAiModeForService(chatModes.get(jid) || DEFAULT_AI_MODE);
+function switchChatWebAiService(jid, service) {
+  const currentService = getConfiguredService(jid);
+  const nextService = normalizeWebAiService(service);
+
+  if (nextService === currentService) {
+    return `Chat ini sudah memakai ${getWebAiLabel(nextService)}.\n${formatServiceSwitchHelp()}`;
+  }
+
+  chatServices.set(jid, nextService);
+  saveAiServices();
+  warmWebAiBrowser(nextService);
+
+  return `AI browser chat ini diganti ke ${getWebAiLabel(nextService)}.\nPertanyaan berikutnya dari chat ini akan memakai ${getWebAiLabel(nextService)}.`;
+}
+
+function clearChatWebAiService(jid) {
+  if (!chatServices.has(jid)) {
+    return `Chat ini sudah memakai default: ${getWebAiLabel(webAiService)}.`;
+  }
+
+  chatServices.delete(jid);
+  saveAiServices();
+  warmWebAiBrowser(webAiService);
+  return `AI browser chat ini dikembalikan ke default: ${getWebAiLabel(webAiService)}.`;
+}
+
+function switchDefaultWebAiServiceFromChat(service) {
+  const nextService = normalizeWebAiService(service);
+
+  if (nextService === webAiService) {
+    return `Default AI browser sudah ${getWebAiLabel(nextService)}.\n${formatServiceSwitchHelp()}`;
+  }
+
+  setWebAiService(nextService, { save: true });
+  warmWebAiBrowser(nextService);
+  return `Default AI browser diganti ke ${getWebAiLabel(nextService)}.\nChat yang belum punya pilihan sendiri akan memakai ${getWebAiLabel(nextService)}.`;
+}
+
+function getConfiguredService(jid = 'default') {
+  return chatServices.get(jid) || webAiService;
+}
+
+function getConfiguredMode(jid, service = getConfiguredService(jid)) {
+  return coerceAiModeForService(chatModes.get(jid) || DEFAULT_AI_MODE, service);
 }
 
 function coerceAiModeForService(mode, service = webAiService) {
@@ -1355,13 +1572,13 @@ function coerceAiModeForService(mode, service = webAiService) {
   return mode;
 }
 
-function resolveModeForQuestion(jid, question) {
-  const configuredMode = getConfiguredMode(jid);
+function resolveModeForQuestion(jid, question, service = getConfiguredService(jid)) {
+  const configuredMode = getConfiguredMode(jid, service);
   if (configuredMode !== 'auto') return configuredMode;
-  return classifyQuestionMode(question);
+  return classifyQuestionMode(question, service);
 }
 
-function classifyQuestionMode(question) {
+function classifyQuestionMode(question, service = webAiService) {
   const text = String(question || '').toLowerCase();
   const wordCount = text.split(/\s+/).filter(Boolean).length;
 
@@ -1369,7 +1586,7 @@ function classifyQuestionMode(question) {
     wordCount > 180 ||
     /pro|mendalam|komprehensif|detail banget|riset|audit|arsitektur|rancang|strategi|proposal|dokumen|review kode|code review|produksi|enterprise|skalabilitas|security/i.test(text)
   ) {
-    return webAiService === 'gemini' ? 'pro' : 'thinking';
+    return service === 'gemini' ? 'pro' : 'thinking';
   }
 
   if (
@@ -1424,27 +1641,77 @@ function normalizeAiMode(value) {
   return '';
 }
 
+function normalizeWebAiSwitchService(value) {
+  const normalized = String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ');
+
+  if (['gemini', 'google', 'google gemini'].includes(normalized)) return 'gemini';
+  if (['chatgpt', 'chat gpt', 'gpt', 'openai', 'open ai'].includes(normalized)) return 'chatgpt';
+  return '';
+}
+
 function formatModeHelp(jid, isGroup) {
-  const current = getConfiguredMode(jid);
+  const service = getConfiguredService(jid);
+  const current = getConfiguredMode(jid, service);
   return [
-    `AI browser: ${getWebAiLabel()}.`,
-    `Mode AI sekarang: ${getModeDisplayName(current)}.`,
-    getModeBehaviorDescription(),
+    `AI browser chat ini: ${getWebAiLabel(service)}${chatServices.has(jid) ? '' : ' (default)'}.`,
+    `Mode AI sekarang: ${getModeDisplayName(current, service)}.`,
+    getModeBehaviorDescription(service),
     '',
-    formatModeList(),
+    formatModeList(service),
     '',
-    ...getModeCommandHelpLines(),
+    formatServiceSwitchHelp(),
+    '',
+    ...getModeCommandHelpLines(service),
     '',
     isGroup ? `Di group, tanya AI dengan: ${PUBLIC_AI_PREFIX} pertanyaan` : 'Di private chat, langsung kirim pertanyaan tanpa prefix.'
   ].join('\n');
 }
 
-function formatModeList() {
-  return getModeListEntries().map(([name, description]) => `${name}: ${description}`).join('\n');
+function formatAiStatus({ jid, message, isGroup }) {
+  const service = getConfiguredService(jid);
+  const mode = getConfiguredMode(jid, service);
+  const sessionKey = message ? getAiSessionKey({ jid, message, isGroup }) : normalizeWhatsAppSessionJid(jid);
+  const serviceSource = chatServices.has(jid) ? 'chat ini' : 'default';
+  const state = getWebAiState(service);
+  const activeTotal = [...queueCountsBySession.values()].reduce((total, count) => total + count, 0);
+
+  return [
+    `AI browser chat ini: ${getWebAiLabel(service)} (${serviceSource}).`,
+    `Default AI browser: ${getWebAiLabel(webAiService)}.`,
+    `Mode chat ini: ${getModeDisplayName(mode, service)}.`,
+    `Browser ${getWebAiLabel(service)}: ${formatWebAiStateStatus(state)}.`,
+    `Session aktif ${getWebAiLabel(service)}: ${state.sessions.size}.`,
+    `Antrean chat ini: ${getQueueCount(sessionKey)}/${MAX_QUEUE_PER_CHAT}.`,
+    `Antrean total: ${activeTotal}.`,
+    `Retry AI macet: maksimal ${MAX_WEB_AI_ATTEMPTS} kali.`
+  ].join('\n');
 }
 
-function getModeDisplayName(mode) {
-  if (webAiService === 'gemini') {
+function formatWebAiStateStatus(state) {
+  if (state.warmupPromise || state.initPromise) return 'sedang disiapkan';
+  if (state.context) return 'siap';
+  return 'belum dibuka';
+}
+
+function formatModeList(service = webAiService) {
+  return getModeListEntries(service).map(([name, description]) => `${name}: ${description}`).join('\n');
+}
+
+function formatServiceSwitchHelp() {
+  return [
+    `Switch AI chat ini: ${PUBLIC_AI_PREFIX} mode gemini / ${PUBLIC_AI_PREFIX} mode chatgpt`,
+    `Balik ke default: ${PUBLIC_AI_PREFIX} mode default`,
+    `Ubah default semua chat: ${PUBLIC_AI_PREFIX} mode global gemini / ${PUBLIC_AI_PREFIX} mode global chatgpt`,
+    `Cek status: ${PUBLIC_AI_PREFIX} status`
+  ].join('\n');
+}
+
+function getModeDisplayName(mode, service = webAiService) {
+  if (service === 'gemini') {
     if (mode === 'instant') return 'cepat';
     if (mode === 'thinking') return 'penalaran';
     if (mode === 'pro') return 'pro';
@@ -1453,8 +1720,8 @@ function getModeDisplayName(mode) {
   return mode;
 }
 
-function getModeDescription(mode) {
-  if (webAiService === 'gemini') {
+function getModeDescription(mode, service = webAiService) {
+  if (service === 'gemini') {
     if (mode === 'auto') return 'Bot memilih mode Gemini cepat, penalaran, atau pro dari isi pertanyaan.';
     if (mode === 'instant') return 'Memakai mode Gemini cepat untuk respons cepat.';
     if (mode === 'thinking') return 'Memakai mode Gemini penalaran untuk pertanyaan yang butuh nalar lebih matang.';
@@ -1467,25 +1734,25 @@ function getModeDescription(mode) {
   return '';
 }
 
-function getModeListEntries() {
-  if (webAiService === 'gemini') {
+function getModeListEntries(service = webAiService) {
+  if (service === 'gemini') {
     return [
-      ['auto', getModeDescription('auto')],
-      ['cepat / instant', getModeDescription('instant')],
-      ['penalaran / thinking', getModeDescription('thinking')],
-      ['pro', getModeDescription('pro')]
+      ['auto', getModeDescription('auto', service)],
+      ['cepat / instant', getModeDescription('instant', service)],
+      ['penalaran / thinking', getModeDescription('thinking', service)],
+      ['pro', getModeDescription('pro', service)]
     ];
   }
 
   return [
-    ['auto', getModeDescription('auto')],
-    ['instant', getModeDescription('instant')],
-    ['thinking', getModeDescription('thinking')]
+    ['auto', getModeDescription('auto', service)],
+    ['instant', getModeDescription('instant', service)],
+    ['thinking', getModeDescription('thinking', service)]
   ];
 }
 
-function getModeCommandHelpLines() {
-  if (webAiService === 'gemini') {
+function getModeCommandHelpLines(service = webAiService) {
+  if (service === 'gemini') {
     return [
       `Ubah mode: ${PUBLIC_AI_PREFIX} mode cepat`,
       `${PUBLIC_AI_PREFIX} mode penalaran`,
@@ -1495,6 +1762,41 @@ function getModeCommandHelpLines() {
   }
 
   return [`Ubah mode: ${PUBLIC_AI_PREFIX} mode instant`, `${PUBLIC_AI_PREFIX} mode thinking`, `${PUBLIC_AI_PREFIX} mode auto`];
+}
+
+function loadAiServices() {
+  if (!existsSync(AI_SERVICE_FILE)) {
+    return { defaultService: '', chatServices: new Map() };
+  }
+
+  try {
+    const saved = JSON.parse(readFileSync(AI_SERVICE_FILE, 'utf8'));
+    const defaultService = normalizeWebAiSwitchService(saved?.defaultService || saved?.default || '');
+    const chatEntries = Object.entries(saved?.chats || saved?.chatServices || {})
+      .map(([jid, service]) => [jid, normalizeWebAiSwitchService(service)])
+      .filter(([, service]) => service);
+
+    return {
+      defaultService,
+      chatServices: new Map(chatEntries)
+    };
+  } catch (error) {
+    console.warn(`Gagal membaca ${AI_SERVICE_FILE}: ${error.message}`);
+    return { defaultService: '', chatServices: new Map() };
+  }
+}
+
+function saveAiServices() {
+  const payload = {
+    defaultService: webAiService,
+    chats: Object.fromEntries(chatServices.entries())
+  };
+
+  try {
+    writeFileSync(AI_SERVICE_FILE, `${JSON.stringify(payload, null, 2)}\n`);
+  } catch (error) {
+    console.warn(`Gagal menyimpan ${AI_SERVICE_FILE}: ${error.message}`);
+  }
 }
 
 function loadChatModes() {
@@ -1524,7 +1826,7 @@ function saveChatModes() {
 
 async function sendLongText(sock, jid, text, quotedMessage) {
   for (const chunk of splitWhatsAppText(text)) {
-    await sock.sendMessage(jid, { text: chunk }, { quoted: quotedMessage });
+    await sock.sendMessage(jid, { text: chunk, linkPreview: null }, { quoted: quotedMessage });
   }
 }
 
@@ -1584,12 +1886,12 @@ function normalizeWebAiService(value) {
   return service;
 }
 
-function getWebAiLabel() {
-  return webAiService === 'gemini' ? 'Gemini' : 'ChatGPT';
+function getWebAiLabel(service = webAiService) {
+  return service === 'gemini' ? 'Gemini' : 'ChatGPT';
 }
 
-function getModeBehaviorDescription() {
-  if (webAiService === 'gemini') {
+function getModeBehaviorDescription(service = webAiService) {
+  if (service === 'gemini') {
     return 'Di Gemini, mode ini memilih menu mode asli di UI jika tersedia.';
   }
 
@@ -1604,17 +1906,30 @@ function resolveBrowserUserAgent(service) {
   return process.env.BROWSER_USER_AGENT || (service === 'chatgpt' ? CHATGPT_USER_AGENT : '');
 }
 
-function setWebAiService(service) {
+function setWebAiService(service, { save = false } = {}) {
   webAiService = normalizeWebAiService(service);
   browserProfile = resolveBrowserProfile(webAiService);
   browserUserAgent = resolveBrowserUserAgent(webAiService);
+  if (save) saveAiServices();
 }
 
 async function configureStartupWebAiService(serviceOverride = '') {
-  const explicitService = serviceOverride || WEB_AI_SERVICE_ARG || process.env.WEB_AI_SERVICE || '';
+  const overrideService = normalizeWebAiSwitchService(serviceOverride);
+  if (overrideService) {
+    setWebAiService(overrideService, { save: true });
+    printSelectedWebAiService('override');
+    return;
+  }
 
+  if (savedAiServices.defaultService) {
+    setWebAiService(savedAiServices.defaultService);
+    printSelectedWebAiService('saved');
+    return;
+  }
+
+  const explicitService = WEB_AI_SERVICE_ARG || process.env.WEB_AI_SERVICE || '';
   if (explicitService) {
-    setWebAiService(explicitService);
+    setWebAiService(explicitService, { save: true });
     printSelectedWebAiService();
     return;
   }
@@ -1636,7 +1951,7 @@ async function configureStartupWebAiService(serviceOverride = '') {
       const selected = parseWebAiServiceChoice(answer);
 
       if (selected) {
-        setWebAiService(selected);
+        setWebAiService(selected, { save: true });
         printSelectedWebAiService();
         return;
       }
@@ -1659,25 +1974,33 @@ function parseWebAiServiceChoice(value) {
 }
 
 function printSelectedWebAiService(reason = '') {
-  const suffix = reason === 'default' ? ' default non-interaktif' : '';
+  const suffix =
+    reason === 'default'
+      ? ' default non-interaktif'
+      : reason === 'saved'
+        ? ' tersimpan'
+        : reason === 'override'
+          ? ' override'
+          : '';
   console.log(`Mode AI browser${suffix}: ${getWebAiLabel()} (profile: ${browserProfile}).`);
 }
 
-function formatWhatsAppError(error) {
+function formatWhatsAppError(error, service = webAiService) {
+  const label = getWebAiLabel(service);
   if (error instanceof ChatGptGateError) {
     return 'ChatGPT belum bisa dibuka: browser tertahan di halaman security check / "Just a moment...". Cookie perlu di-refresh atau login manual ulang sampai halaman chat terbuka.';
   }
 
   if (error instanceof SessionExpiredError) {
-    const loginScript = webAiService === 'gemini' ? 'npm run login:gemini' : 'npm run login:chatgpt';
-    return `Sesi ${getWebAiLabel()} belum login atau kedaluwarsa. Jalankan ${loginScript}, pastikan halaman chat terbuka, lalu start bot lagi.`;
+    const loginScript = service === 'gemini' ? 'npm run login:gemini' : 'npm run login:chatgpt';
+    return `Sesi ${label} belum login atau kedaluwarsa. Jalankan ${loginScript}, pastikan halaman chat terbuka, lalu start bot lagi.`;
   }
 
   if (error instanceof SelectorTimeoutError || isTimeoutError(error)) {
-    return `Error: timeout menunggu selector ${getWebAiLabel()}. ${error.message}`;
+    return `${label} belum merespons setelah dicoba ulang. Browser sudah di-reload otomatis, tapi masih timeout.\nDetail: ${error.message}`;
   }
 
-  return `Error: ${error.message || `Gagal meminta jawaban ke ${getWebAiLabel()}.`}`;
+  return `Error: ${error.message || `Gagal meminta jawaban ke ${label}.`}`;
 }
 
 function isTimeoutError(error) {
@@ -1723,7 +2046,7 @@ export async function startBot(options = {}) {
 
 async function shutdown() {
   clearTimeout(reconnectTimer);
-  await resetWebAiBrowser();
+  await resetAllWebAiBrowsers();
 
   try {
     waSock?.end?.(new Error('Process interrupted.'));
