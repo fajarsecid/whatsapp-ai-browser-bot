@@ -15,6 +15,8 @@ Project ini tidak memakai OpenAI API key, Gemini API key, atau model lokal. Semu
 - ChatGPT memakai login manual di browser profile, tanpa import cookie.
 - Remote login AI dari HP lewat panel screenshot browser.
 - Retry otomatis saat web AI timeout atau selector tidak muncul.
+- Gambar dari WhatsApp bisa diteruskan ke Gemini/ChatGPT untuk dibaca jika dikirim dengan caption pertanyaan.
+- Gambar hasil Gemini/ChatGPT dikirim ke WhatsApp sebagai media jika muncul di balasan AI.
 - Backup runtime dan profile AI bisa dibuat lokal, tetapi tidak boleh di-upload ke GitHub.
 
 ## Cara Kerja Singkat
@@ -28,7 +30,8 @@ Project ini tidak memakai OpenAI API key, Gemini API key, atau model lokal. Semu
 5. Bot memakai profile browser yang sesuai:
    - Gemini: `./browser-profile-gemini`
    - ChatGPT: `./browser-profile`
-6. Bot mengetik pertanyaan ke web AI, menunggu jawaban selesai, lalu mengirim balasan ke WhatsApp.
+6. Jika pesan WhatsApp berisi gambar, bot meng-upload gambar itu ke composer Gemini/ChatGPT.
+7. Bot mengetik pertanyaan ke web AI, menunggu jawaban selesai, lalu mengirim teks dan/atau gambar ke WhatsApp.
 
 ## Requirement
 
@@ -39,6 +42,19 @@ Project ini tidak memakai OpenAI API key, Gemini API key, atau model lokal. Semu
 - Akun Gemini dan/atau ChatGPT yang bisa login manual.
 - Akun WhatsApp untuk pairing bot.
 - PM2 opsional, tetapi disarankan untuk production.
+
+## Checklist Pemasangan Cepat
+
+Urutan setup paling singkat:
+
+1. Clone repo dan masuk ke folder project.
+2. Jalankan `npm install`.
+3. Install browser Playwright dengan `npx playwright install chromium`.
+4. Di VPS, install dependency Chromium dan `xvfb`.
+5. Salin `.env.example` ke `.env`, lalu isi `PAIRING_PHONE_NUMBER`.
+6. Login WhatsApp dengan `npm run start:gemini` atau `npm start`.
+7. Login akun Gemini/ChatGPT dengan `npm run remote-login:gemini` dan/atau `npm run remote-login:chatgpt`.
+8. Jalankan bot permanen dengan PM2.
 
 ## Install Dari Nol
 
@@ -136,6 +152,12 @@ CHATGPT_HEADLESS=false
 WEB_AI_SESSION_IDLE_MS=300000
 WEB_AI_MAX_ATTEMPTS=2
 MAX_QUEUE_PER_CHAT=2
+WEB_AI_MAX_IMAGES=4
+WEB_AI_MIN_IMAGE_SIZE=128
+WEB_AI_IMAGE_WAIT_MS=60000
+WEB_AI_MAX_INPUT_IMAGES=4
+WEB_AI_MAX_INPUT_IMAGE_BYTES=15000000
+WEB_AI_FILE_CHOOSER_TIMEOUT_MS=6000
 
 # Deteksi jawaban selesai.
 ANSWER_STABLE_INTERVAL_MS=300
@@ -459,6 +481,24 @@ ChatGPT:
 - `pro`: diarahkan ke `thinking`.
 
 Catatan: nama model/mode ChatGPT di prompt adalah instruksi gaya jawaban untuk UI ChatGPT. Jika UI model switcher tidak tersedia, bot tetap lanjut lewat instruksi prompt.
+
+## Balasan Gambar
+
+Jika Gemini atau ChatGPT menghasilkan gambar di halaman web, bot mengambil gambar yang terlihat di balasan AI dan mengirimkannya sebagai media WhatsApp. Ekstraksi gambar hanya dipakai untuk prompt yang terdeteksi meminta pembuatan gambar, jadi gambar yang user upload dari WhatsApp tidak dikirim balik sebagai hasil AI.
+
+- Maksimal gambar per jawaban: `WEB_AI_MAX_IMAGES`, default `4`.
+- Gambar kecil/icon/avatar diabaikan dengan batas `WEB_AI_MIN_IMAGE_SIZE`, default `128` px.
+- Jika prompt terdeteksi minta gambar, bot menunggu gambar sampai `WEB_AI_IMAGE_WAIT_MS`, default `60000` ms.
+
+## Input Gambar WhatsApp
+
+Kirim gambar dengan caption pertanyaan agar gambar ikut dibaca Gemini/ChatGPT.
+
+- Private chat: kirim gambar dengan caption `jelaskan isi gambar ini`.
+- Group chat: caption harus diawali prefix, contoh `.ai jelaskan isi gambar ini`.
+- Maksimal gambar input per pesan: `WEB_AI_MAX_INPUT_IMAGES`, default `4`.
+- Maksimal ukuran tiap gambar: `WEB_AI_MAX_INPUT_IMAGE_BYTES`, default `15000000` bytes.
+- Timeout file picker upload: `WEB_AI_FILE_CHOOSER_TIMEOUT_MS`, default `6000` ms.
 
 ## Antrean Dan Retry
 

@@ -4,13 +4,18 @@ import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import { pathToFileURL } from 'node:url';
 import makeWASocket, {
-  DisconnectReason,
+  downloadMediaMessage,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
   useMultiFileAuthState
 } from '@whiskeysockets/baileys';
 import P from 'pino';
 import qrcode from 'qrcode-terminal';
+import {
+  formatBaileysDisconnect,
+  getBaileysDisconnectAdvice,
+  getBaileysDisconnectInfo
+} from './src/baileys-disconnect.js';
 import { resolveBrowserProfile as resolveServiceBrowserProfile } from './src/browser-profile.js';
 import { loadEnvFile } from './src/env.js';
 import { splitWhatsAppText } from './src/whatsapp.js';
@@ -51,6 +56,18 @@ const MAX_WEB_AI_ATTEMPTS = Math.max(
   Number.parseInt(process.env.WEB_AI_MAX_ATTEMPTS || process.env.MAX_CHATGPT_ATTEMPTS || '', 10) || 2
 );
 const MAX_QUEUE_PER_CHAT = Math.max(1, Number.parseInt(process.env.MAX_QUEUE_PER_CHAT || '', 10) || 2);
+const MAX_WEB_AI_IMAGES = Math.max(1, Number.parseInt(process.env.WEB_AI_MAX_IMAGES || '', 10) || 4);
+const WEB_AI_MIN_IMAGE_SIZE = Math.max(64, Number.parseInt(process.env.WEB_AI_MIN_IMAGE_SIZE || '', 10) || 128);
+const WEB_AI_IMAGE_WAIT_MS = Math.max(5_000, Number.parseInt(process.env.WEB_AI_IMAGE_WAIT_MS || '', 10) || 60_000);
+const MAX_WEB_AI_INPUT_IMAGES = Math.max(1, Number.parseInt(process.env.WEB_AI_MAX_INPUT_IMAGES || '', 10) || 4);
+const MAX_WEB_AI_INPUT_IMAGE_BYTES = Math.max(
+  1_000_000,
+  Number.parseInt(process.env.WEB_AI_MAX_INPUT_IMAGE_BYTES || '', 10) || 15_000_000
+);
+const WEB_AI_FILE_CHOOSER_TIMEOUT_MS = Math.max(
+  2_000,
+  Number.parseInt(process.env.WEB_AI_FILE_CHOOSER_TIMEOUT_MS || '', 10) || 6_000
+);
 const WEB_AI_SESSION_IDLE_MS = Math.max(
   60_000,
   Number.parseInt(process.env.WEB_AI_SESSION_IDLE_MS || '', 10) || 5 * 60_000
@@ -89,9 +106,11 @@ const AI_MODES = Object.freeze({
 });
 
 const GEMINI_MODE_BUTTON_SELECTORS = [
+  'button[aria-label="Open mode picker"]',
   'button[aria-label="Buka pemilih mode"]',
-  'button[aria-label*="pemilih mode"]',
-  'button[aria-label*="mode"]'
+  'button[aria-label*="mode picker" i]',
+  'button[aria-label*="pemilih mode" i]',
+  'button[aria-label*="mode" i]'
 ];
 const GEMINI_MODE_OPTION_SELECTOR = [
   'button[role="menuitem"]',
@@ -109,6 +128,57 @@ const CHATGPT_MODE_OPTION_TESTIDS = Object.freeze({
   instant: 'model-switcher-gpt-5-3',
   thinking: 'model-switcher-gpt-5-5-thinking'
 });
+const WEB_AI_FILE_INPUT_SELECTORS = [
+  'input[type="file"][accept*="image" i]',
+  'input[type="file"][accept*="png" i]',
+  'input[type="file"][accept*="jpg" i]',
+  'input[type="file"][accept*="jpeg" i]',
+  'input[type="file"][accept*="webp" i]',
+  'input[type="file"]'
+];
+const CHATGPT_ATTACHMENT_BUTTON_SELECTORS = [
+  'button[aria-label*="Attach" i]',
+  'button[aria-label*="Upload" i]',
+  'button[data-testid*="upload" i]',
+  'button[data-testid*="attach" i]',
+  'button:has-text("Attach")',
+  'button:has-text("Upload")'
+];
+const GEMINI_ATTACHMENT_BUTTON_SELECTORS = [
+  'button[aria-label*="Upload" i]',
+  'button[aria-label*="Attach" i]',
+  'button[aria-label*="Add files" i]',
+  'button[aria-label*="Add file" i]',
+  'button[aria-label*="Add image" i]',
+  'button[aria-label*="Insert image" i]',
+  'button[aria-label*="Unggah" i]',
+  'button[aria-label*="Lampirkan" i]',
+  'button[aria-label*="Tambahkan file" i]',
+  'button[aria-label*="Tambahkan gambar" i]',
+  'button:has(mat-icon:has-text("add_photo_alternate"))',
+  'button:has(mat-icon:has-text("attach_file"))'
+];
+const WEB_AI_UPLOAD_MENU_SELECTORS = [
+  '[role="menuitem"]:has-text("Upload")',
+  '[role="menuitem"]:has-text("Image")',
+  '[role="menuitem"]:has-text("Photo")',
+  '[role="menuitem"]:has-text("File")',
+  '[role="option"]:has-text("Upload")',
+  '[role="option"]:has-text("Image")',
+  'button:has-text("Upload")',
+  'button:has-text("Image")',
+  'button:has-text("Photo")',
+  'button:has-text("File")',
+  '[role="menuitem"]:has-text("Unggah")',
+  '[role="menuitem"]:has-text("Gambar")',
+  '[role="menuitem"]:has-text("Foto")',
+  '[role="menuitem"]:has-text("File")',
+  '[role="option"]:has-text("Unggah")',
+  '[role="option"]:has-text("Gambar")',
+  'button:has-text("Unggah")',
+  'button:has-text("Gambar")',
+  'button:has-text("Foto")'
+];
 const GENERATION_BUSY_SELECTORS = [
   '[data-testid="stop-button"]',
   'button[aria-label*="Stop" i]',
@@ -187,21 +257,29 @@ function handleConnectionUpdate({ sock, update, shouldUsePairingCode }) {
   }
 
   if (connection === 'open') {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    waSock = sock;
     console.log(`WhatsApp bot ready: ${sock.user?.id || 'connected'}`);
     warmWebAiBrowser();
   }
 
   if (connection === 'close') {
-    const statusCode = lastDisconnect?.error?.output?.statusCode;
-    const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-    console.warn(`Koneksi WhatsApp tertutup. reconnect=${shouldReconnect}`);
+    if (waSock && waSock !== sock) return;
 
-    if (shouldReconnect) {
+    waSock = null;
+    const disconnectInfo = getBaileysDisconnectInfo(lastDisconnect);
+    console.warn(formatBaileysDisconnect(disconnectInfo));
+
+    if (disconnectInfo.shouldReconnect) {
+      if (reconnectTimer) return;
+
       reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
         startWhatsAppClient().catch((error) => console.error('Gagal reconnect WhatsApp:', error));
       }, 3000);
     } else {
-      console.warn(`Session logout. Hapus folder ${WA_AUTH_DIR} lalu pairing ulang jika mau login lagi.`);
+      console.warn(getBaileysDisconnectAdvice(disconnectInfo, WA_AUTH_DIR));
     }
   }
 }
@@ -248,6 +326,7 @@ async function handleBaileysMessage({ sock, message }) {
 
   const isGroup = jid.endsWith('@g.us');
   const body = extractText(message);
+  const hasInputImage = hasWebAiInputImage(message);
   const commandReply = await handleAiCommand({ jid, body, isGroup, message });
   if (commandReply) {
     await sendLongText(sock, jid, commandReply, message);
@@ -255,7 +334,12 @@ async function handleBaileysMessage({ sock, message }) {
   }
 
   const question = resolveQuestion({ body, isGroup });
-  if (question === null) return;
+  if (question === null) {
+    if (!isGroup && hasInputImage) {
+      await sendLongText(sock, jid, 'Kirim gambar dengan caption pertanyaan, contoh: jelaskan isi gambar ini.', message);
+    }
+    return;
+  }
 
   if (!question) {
     await sendLongText(sock, jid, `Kirim pertanyaan setelah ${PUBLIC_AI_PREFIX}.`, message);
@@ -282,12 +366,30 @@ async function handleBaileysMessage({ sock, message }) {
     reactToMessage(sock, jid, message, '⏳')
   ]);
 
+  let inputImages = [];
+  try {
+    inputImages = await downloadWebAiInputImages(sock, message);
+    if (inputImages.length > 0) {
+      console.log(
+        `Downloaded ${inputImages.length} WhatsApp image(s) for ${getWebAiLabel(service)}: ${inputImages
+          .map((image) => `${image.mimeType}/${formatBytes(image.buffer.length)}`)
+          .join(', ')}.`
+      );
+    }
+  } catch (error) {
+    console.error('Failed to download WhatsApp image:', error);
+    await sendLongText(sock, jid, `Gagal membaca gambar WhatsApp: ${error.message}`, message);
+    reactToMessage(sock, jid, message, '❌');
+    return;
+  }
+
   incrementQueueCount(aiSessionKey);
   queue.push({
     sock,
     jid,
     quotedMessage: message,
     question,
+    inputImages,
     aiSessionKey,
     service
   });
@@ -302,7 +404,7 @@ async function processQueue() {
 
   try {
     while (queue.length > 0) {
-      const { sock, jid, quotedMessage, question, aiSessionKey, service } = queue.shift();
+      const { sock, jid, quotedMessage, question, inputImages = [], aiSessionKey, service } = queue.shift();
       const activeSock = waSock || sock;
       let retryNoticeSent = false;
 
@@ -311,6 +413,8 @@ async function processQueue() {
           jid,
           sessionKey: aiSessionKey,
           service,
+          inputImages,
+          includeMedia: true,
           onRetry: async () => {
             if (retryNoticeSent) return;
             retryNoticeSent = true;
@@ -322,7 +426,14 @@ async function processQueue() {
             );
           }
         });
-        await sendLongText(activeSock, jid, answer || `${getWebAiLabel(service)} tidak mengembalikan jawaban.`, quotedMessage);
+        await sendWebAiAnswer(
+          activeSock,
+          jid,
+          answer,
+          `${getWebAiLabel(service)} tidak mengembalikan jawaban.`,
+          quotedMessage,
+          service
+        );
         reactToMessage(activeSock, jid, quotedMessage, '✅');
       } catch (error) {
         console.error('Failed to answer message:', error);
@@ -343,7 +454,14 @@ export async function askChatGPT(question) {
 
 export async function askWebAi(
   question,
-  { jid = 'default', sessionKey = jid, service = getConfiguredService(jid), onRetry = null } = {}
+  {
+    jid = 'default',
+    sessionKey = jid,
+    service = getConfiguredService(jid),
+    inputImages = [],
+    includeMedia = false,
+    onRetry = null
+  } = {}
 ) {
   let lastError = null;
   const aiService = normalizeWebAiService(service);
@@ -353,9 +471,12 @@ export async function askWebAi(
   for (let attempt = 1; attempt <= MAX_WEB_AI_ATTEMPTS; attempt += 1) {
     try {
       const page = await getWebAiPage(aiService, aiSessionKey);
-      if (aiService === 'gemini') return await askGeminiOnPage(page, question, mode);
-      const prompt = buildModePrompt(question, mode);
-      return await askChatGPTOnPage(page, prompt, mode);
+      const result =
+        aiService === 'gemini'
+          ? await askGeminiOnPage(page, question, mode, inputImages)
+          : await askChatGPTOnPage(page, buildChatGptPrompt(question, mode), mode, question, inputImages);
+
+      return includeMedia ? result : result.text;
     } catch (error) {
       lastError = error;
 
@@ -652,27 +773,180 @@ function getWebAiBrowserOptions(service = webAiService) {
   };
 }
 
-async function askChatGPTOnPage(page, question, mode) {
+async function attachWebAiInputImages(page, inputImages = [], service = webAiService) {
+  if (!inputImages.length) return;
+
+  const files = inputImages.slice(0, MAX_WEB_AI_INPUT_IMAGES).map((image, index) => ({
+    name: image.filename || `whatsapp-image-${index + 1}.${getImageExtension(image.mimeType)}`,
+    mimeType: image.mimeType || 'image/jpeg',
+    buffer: image.buffer
+  }));
+
+  if (await setFilesOnAvailableInput(page, files)) return;
+
+  const attachmentButtonSelectors = service === 'gemini' ? GEMINI_ATTACHMENT_BUTTON_SELECTORS : CHATGPT_ATTACHMENT_BUTTON_SELECTORS;
+  const attachmentButtons = await findVisibleEnabledLocators(page, attachmentButtonSelectors, 8_000);
+  if (attachmentButtons.length === 0) {
+    if (await dropFilesOnPrompt(page, files)) return;
+    throw new Error(`Tidak menemukan tombol upload gambar di ${getWebAiLabel(service)}.`);
+  }
+
+  for (const attachmentButton of attachmentButtons) {
+    if (await clickAndSetFileChooser(page, attachmentButton, files)) return;
+    if (await setFilesOnAvailableInput(page, files)) return;
+    if (await clickUploadMenuAndSetFiles(page, files)) return;
+    await page.keyboard.press('Escape').catch(() => {});
+  }
+
+  if (await dropFilesOnPrompt(page, files)) return;
+  throw new Error(`Tidak bisa membuka file picker upload gambar di ${getWebAiLabel(service)}.`);
+}
+
+async function setFilesOnAvailableInput(page, files) {
+  const fileInput = await findWebAiFileInput(page);
+  if (!fileInput) return false;
+
+  await fileInput.setInputFiles(files, { timeout: SELECTOR_TIMEOUT_MS });
+  await waitForWebAiInputImagesAttached(page);
+  console.log(`Attached ${files.length} image(s) via direct file input.`);
+  return true;
+}
+
+async function clickAndSetFileChooser(page, locator, files) {
+  const fileChooserPromise = page.waitForEvent('filechooser', { timeout: WEB_AI_FILE_CHOOSER_TIMEOUT_MS }).catch(() => null);
+  await locator.click({ timeout: SELECTOR_TIMEOUT_MS }).catch(() => {});
+  const fileChooser = await fileChooserPromise;
+  if (!fileChooser) return false;
+
+  await fileChooser.setFiles(files);
+  await waitForWebAiInputImagesAttached(page);
+  console.log(`Attached ${files.length} image(s) via file chooser.`);
+  return true;
+}
+
+async function clickUploadMenuAndSetFiles(page, files) {
+  const uploadItems = await findVisibleEnabledLocators(page, WEB_AI_UPLOAD_MENU_SELECTORS, 2_000);
+  for (const uploadItem of uploadItems) {
+    if (await clickAndSetFileChooser(page, uploadItem, files)) return true;
+    if (await setFilesOnAvailableInput(page, files)) return true;
+  }
+
+  return false;
+}
+
+async function dropFilesOnPrompt(page, files) {
+  const prompt = await findFirstVisibleEnabledLocator(
+    page,
+    [
+      'rich-textarea [contenteditable="true"]',
+      '.ql-editor[contenteditable="true"]',
+      'div#prompt-textarea[contenteditable="true"]',
+      '[data-testid="prompt-textarea"][contenteditable="true"]',
+      '[contenteditable="true"][role="textbox"]',
+      '[contenteditable="true"]',
+      'textarea'
+    ],
+    3_000
+  );
+  if (!prompt) return false;
+
+  const dropped = await prompt
+    .evaluate(
+      (element, uploadFiles) => {
+        const dataTransfer = new DataTransfer();
+
+        for (const file of uploadFiles) {
+          const binary = atob(file.data);
+          const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+          dataTransfer.items.add(new File([bytes], file.name, { type: file.mimeType }));
+        }
+
+        for (const eventName of ['dragenter', 'dragover', 'drop']) {
+          element.dispatchEvent(
+            new DragEvent(eventName, {
+              bubbles: true,
+              cancelable: true,
+              dataTransfer
+            })
+          );
+        }
+
+        return true;
+      },
+      files.map((file) => ({
+        name: file.name,
+        mimeType: file.mimeType,
+        data: file.buffer.toString('base64')
+      }))
+    )
+    .catch(() => false);
+
+  if (!dropped) return false;
+  await waitForWebAiInputImagesAttached(page);
+  console.log(`Attached ${files.length} image(s) via drag/drop.`);
+  return true;
+}
+
+async function waitForWebAiInputImagesAttached(page) {
+  await page.waitForTimeout(1500);
+}
+
+async function findWebAiFileInput(page) {
+  for (const selector of WEB_AI_FILE_INPUT_SELECTORS) {
+    const inputs = page.locator(selector);
+    const count = await inputs.count().catch(() => 0);
+
+    for (let index = 0; index < count; index += 1) {
+      const input = inputs.nth(index);
+      const usable = await input
+        .evaluate((element) => {
+          if (!(element instanceof HTMLInputElement)) return false;
+          if (element.disabled || element.getAttribute('aria-disabled') === 'true') return false;
+
+          const accept = (element.accept || '').toLowerCase();
+          return !accept || accept.includes('image') || /png|jpe?g|webp|\*/i.test(accept);
+        })
+        .catch(() => false);
+
+      if (usable) return input;
+    }
+  }
+
+  return null;
+}
+
+async function askChatGPTOnPage(page, question, mode, originalQuestion = question, inputImages = []) {
   await ensureChatGptPageReady(page);
-  await selectChatGptMode(page, mode);
+  const expectImage = isImageGenerationRequest(originalQuestion);
+  if (!expectImage) await selectChatGptMode(page, mode);
+
   const prompt = await findChatGptPrompt(page);
+  const beforeImageKeys = expectImage
+    ? await collectAssistantImageKeys(page.locator('main'), { page, service: 'chatgpt' })
+    : new Set();
+
+  await attachWebAiInputImages(page, inputImages, 'chatgpt');
   await fillChatGptPrompt(page, prompt, question);
   await submitChatGptPrompt(page);
 
-  const assistantMessages = await waitForAssistantResponse(page);
-  await waitForSelectorOrTimeout(
-    assistantMessages.last(),
-    '[data-message-author-role="assistant"]',
-    SELECTOR_TIMEOUT_MS
-  );
-  await waitForAssistantTextStable(page, assistantMessages.last(), mode === 'instant' ? 1 : ANSWER_STABLE_CHECKS);
+  const response = await waitForChatGptResponse(page, { expectImage, beforeImageKeys });
+  await waitForSelectorOrTimeout(response.locator, 'ChatGPT response', SELECTOR_TIMEOUT_MS);
+  await waitForAssistantContentStable(page, response.locator, mode === 'instant' ? 1 : ANSWER_STABLE_CHECKS, {
+    expectImage,
+    service: 'chatgpt',
+    excludeImageKeys: beforeImageKeys
+  });
 
-  const answer = (await assistantMessages.last().innerText({ timeout: SELECTOR_TIMEOUT_MS })).trim();
-  if (!answer) {
+  const answer = response.hasAssistant ? (await response.locator.innerText({ timeout: SELECTOR_TIMEOUT_MS })).trim() : '';
+  const images = expectImage
+    ? await extractAssistantImages(response.locator, { page, service: 'chatgpt', excludeKeys: beforeImageKeys })
+    : [];
+  if (images.length > 0) console.log(`Extracted ${images.length} image(s) from ChatGPT response.`);
+  if (!answer && images.length === 0) {
     throw new Error('Jawaban ChatGPT kosong.');
   }
 
-  return answer;
+  return createWebAiResult(answer, images);
 }
 
 async function ensureChatGptPageReady(page) {
@@ -689,11 +963,12 @@ async function ensureChatGptPageReady(page) {
   await findChatGptPrompt(page);
 }
 
-async function askGeminiOnPage(page, question, mode) {
+async function askGeminiOnPage(page, question, mode, inputImages = []) {
   await ensureGeminiPageReady(page);
 
   const prompt = await findGeminiPrompt(page);
   await selectGeminiMode(page, mode);
+  await attachWebAiInputImages(page, inputImages, 'gemini');
   const responseLocators = getGeminiResponseLocators(page);
   const beforeCounts = await Promise.all(responseLocators.map((locator) => locator.count().catch(() => 0)));
 
@@ -701,14 +976,20 @@ async function askGeminiOnPage(page, question, mode) {
   await submitGeminiPrompt(page);
 
   const response = await waitForGeminiResponse(page, responseLocators, beforeCounts);
-  await waitForAssistantTextStable(page, response, mode === 'instant' ? 1 : ANSWER_STABLE_CHECKS);
+  const expectImage = isImageGenerationRequest(question);
+  await waitForAssistantContentStable(page, response, mode === 'instant' ? 1 : ANSWER_STABLE_CHECKS, {
+    expectImage,
+    service: 'gemini'
+  });
 
-  const answer = (await response.innerText({ timeout: SELECTOR_TIMEOUT_MS })).trim();
-  if (!answer) {
+  const answer = cleanupGeminiAnswer((await response.innerText({ timeout: SELECTOR_TIMEOUT_MS })).trim());
+  const images = expectImage ? await extractAssistantImages(response, { page, service: 'gemini' }) : [];
+  if (images.length > 0) console.log(`Extracted ${images.length} image(s) from Gemini response.`);
+  if (!answer && images.length === 0) {
     throw new Error('Jawaban Gemini kosong.');
   }
 
-  return cleanupGeminiAnswer(answer);
+  return createWebAiResult(answer, images);
 }
 
 async function ensureGeminiPageReady(page) {
@@ -764,9 +1045,13 @@ async function submitGeminiPrompt(page) {
   const sendButton = page
     .locator(
       [
-        'button[aria-label*="Send"]',
-        'button[aria-label*="Submit"]',
-        'button:has(mat-icon:has-text("send"))',
+        'button[aria-label*="Send message" i]',
+        'button[aria-label*="Send prompt" i]',
+        'button[aria-label*="Send" i]',
+        'button[aria-label*="Kirim pesan" i]',
+        'button[aria-label*="Kirim prompt" i]',
+        'button[aria-label="Kirim" i]',
+        'button[aria-label*="Submit" i]',
         'button:has(mat-icon:has-text("send"))'
       ].join(', ')
     )
@@ -804,12 +1089,27 @@ async function selectGeminiMode(page, mode) {
     );
   }
 
-  await option.click({ timeout: SELECTOR_TIMEOUT_MS, force: true });
-  await page.waitForTimeout(750);
+  const optionText = normalizeVisibleText(await option.innerText({ timeout: 2_000 }).catch(() => ''));
+  const optionEnabled = await option.isEnabled({ timeout: 1_000 }).catch(() => false);
+  if (!optionEnabled) {
+    await page.keyboard.press('Escape').catch(() => {});
+    throw new Error(
+      `Mode Gemini ${modeConfig.label} terlihat tetapi tidak aktif/dapat dipilih: ${optionText || modeConfig.label}.`
+    );
+  }
+
+  await option.click({ timeout: SELECTOR_TIMEOUT_MS });
+  await waitForGeminiModeSelected(page, mode, modeConfig.label);
 }
 
 async function findFirstVisibleEnabledLocator(page, selectors, timeout = SELECTOR_TIMEOUT_MS) {
+  const locators = await findVisibleEnabledLocators(page, selectors, timeout, { firstOnly: true });
+  return locators[0] || null;
+}
+
+async function findVisibleEnabledLocators(page, selectors, timeout = SELECTOR_TIMEOUT_MS, { firstOnly = false } = {}) {
   const deadline = Date.now() + timeout;
+  const matches = [];
 
   while (Date.now() < deadline) {
     for (const selector of selectors) {
@@ -820,14 +1120,18 @@ async function findFirstVisibleEnabledLocator(page, selectors, timeout = SELECTO
         const candidate = locator.nth(index);
         const visible = await candidate.isVisible({ timeout: 500 }).catch(() => false);
         const enabled = visible ? await candidate.isEnabled({ timeout: 500 }).catch(() => false) : false;
-        if (visible && enabled) return candidate;
+        if (visible && enabled) {
+          matches.push(candidate);
+          if (firstOnly) return matches;
+        }
       }
     }
 
+    if (matches.length > 0) return matches;
     await delay(300);
   }
 
-  return null;
+  return matches;
 }
 
 async function findGeminiModeOption(page, mode) {
@@ -841,10 +1145,28 @@ async function findGeminiModeOption(page, mode) {
     if (!visible) continue;
 
     const text = normalizeVisibleText(await option.innerText({ timeout: 2_000 }).catch(() => ''));
-    if (matcher.test(text)) return option;
+    const aria = normalizeVisibleText(await option.getAttribute('aria-label').catch(() => ''));
+    if (matcher.test(`${text} ${aria}`)) return option;
   }
 
   return null;
+}
+
+async function waitForGeminiModeSelected(page, mode, label) {
+  const deadline = Date.now() + 8_000;
+  let lastVisibleMode = '';
+
+  while (Date.now() < deadline) {
+    const modeButton = await findFirstVisibleEnabledLocator(page, GEMINI_MODE_BUTTON_SELECTORS, 1_000);
+    if (modeButton) {
+      lastVisibleMode = normalizeVisibleText(await modeButton.innerText({ timeout: 1_000 }).catch(() => ''));
+      if (matchesGeminiMode(lastVisibleMode, mode)) return;
+    }
+
+    await delay(300);
+  }
+
+  throw new Error(`Gagal mengubah mode Gemini ke ${label}. Mode aktif masih: ${lastVisibleMode || '-'}.`);
 }
 
 async function getVisibleGeminiModeOptions(page) {
@@ -856,7 +1178,8 @@ async function getVisibleGeminiModeOptions(page) {
     const option = options.nth(index);
     if (!(await option.isVisible({ timeout: 300 }).catch(() => false))) continue;
     const text = normalizeVisibleText(await option.innerText({ timeout: 1000 }).catch(() => ''));
-    if (text) texts.push(text);
+    const enabled = await option.isEnabled({ timeout: 300 }).catch(() => false);
+    if (text) texts.push(enabled ? text : `${text} (nonaktif)`);
   }
 
   return texts;
@@ -1021,7 +1344,10 @@ async function submitChatGptPrompt(page) {
         '[data-testid="send-button"]',
         'button[aria-label="Send prompt"]',
         'button[aria-label="Send message"]',
-        'button[aria-label*="Send"]'
+        'button[aria-label*="Send" i]',
+        'button[aria-label*="Kirim pesan" i]',
+        'button[aria-label*="Kirim prompt" i]',
+        'button[aria-label="Kirim" i]'
       ].join(', ')
     )
     .first();
@@ -1260,48 +1586,90 @@ function getChatGptNativeMode(mode) {
   return '';
 }
 
-async function waitForAssistantResponse(page) {
+async function waitForChatGptResponse(page, { expectImage = false, beforeImageKeys = new Set() } = {}) {
   const assistantMessages = page.locator('[data-message-author-role="assistant"]');
   const beforeCount = await assistantMessages.count().catch(() => 0);
-
-  await page
-    .waitForFunction(
-      (count) => document.querySelectorAll('[data-message-author-role="assistant"]').length > count,
-      beforeCount,
-      { timeout: ANSWER_START_TIMEOUT_MS }
-    )
-    .catch(async (error) => {
-      if (await isChatGPTSessionExpired(page)) {
-        throw new SessionExpiredError();
-      }
-      throw error;
-    });
-
-  return assistantMessages;
-}
-
-async function waitForAssistantTextStable(page, locator, stableTarget = ANSWER_STABLE_CHECKS) {
-  let previous = '';
-  let stableCount = 0;
-  const deadline = Date.now() + ANSWER_DONE_TIMEOUT_MS;
+  const timeout = expectImage ? Math.max(ANSWER_START_TIMEOUT_MS, WEB_AI_IMAGE_WAIT_MS, 120_000) : ANSWER_START_TIMEOUT_MS;
+  const deadline = Date.now() + timeout;
+  let lastError = null;
 
   while (Date.now() < deadline) {
-    const [currentText, isBusy] = await Promise.all([
-      locator.innerText({ timeout: Math.max(1000, ANSWER_STABLE_INTERVAL_MS * 2) }).catch(() => ''),
+    try {
+      if ((await assistantMessages.count().catch(() => 0)) > beforeCount) {
+        return { locator: assistantMessages.last(), hasAssistant: true };
+      }
+
+      if (expectImage) {
+        const imageCount = await countAssistantImages(page.locator('main'), {
+          page,
+          service: 'chatgpt',
+          excludeKeys: beforeImageKeys
+        });
+        if (imageCount > 0) {
+          return { locator: page.locator('main'), hasAssistant: false };
+        }
+      }
+    } catch (error) {
+      lastError = error;
+    }
+
+    if (await isChatGPTSessionExpired(page)) {
+      throw new SessionExpiredError();
+    }
+
+    await delay(500);
+  }
+
+  throw new SelectorTimeoutError(expectImage ? 'ChatGPT response or generated image' : 'ChatGPT response', timeout, lastError);
+}
+
+async function waitForAssistantContentStable(
+  page,
+  locator,
+  stableTarget = ANSWER_STABLE_CHECKS,
+  { expectImage = false, service = webAiService, excludeImageKeys = new Set() } = {}
+) {
+  let previousSignature = '';
+  let stableCount = 0;
+  const deadline = Date.now() + ANSWER_DONE_TIMEOUT_MS;
+  const imageWaitDeadline = expectImage ? Date.now() + WEB_AI_IMAGE_WAIT_MS : 0;
+
+  while (Date.now() < deadline) {
+    const [content, isBusy] = await Promise.all([
+      getAssistantContentState(locator, { page, service, excludeImageKeys }),
       isGenerationBusyVisible(page)
     ]);
-    const current = currentText.trim();
+    const hasContent = Boolean(content.text || content.imageCount > 0);
+    const waitingForExpectedImage =
+      expectImage &&
+      content.imageCount === 0 &&
+      (isBusy || Date.now() < imageWaitDeadline) &&
+      !isImageUnavailableText(content.text);
 
-    if (!isBusy && current && current === previous) {
+    if (!isBusy && !waitingForExpectedImage && hasContent && content.signature === previousSignature) {
       stableCount += 1;
       if (stableCount >= Math.max(1, stableTarget)) return;
     } else {
-      previous = current;
+      previousSignature = content.signature;
       stableCount = 0;
     }
 
     await delay(ANSWER_STABLE_INTERVAL_MS);
   }
+}
+
+async function getAssistantContentState(locator, { page = null, service = webAiService, excludeImageKeys = new Set() } = {}) {
+  const [text, imageCount] = await Promise.all([
+    locator.innerText({ timeout: Math.max(1000, ANSWER_STABLE_INTERVAL_MS * 2) }).catch(() => ''),
+    countAssistantImages(locator, { page, service, excludeKeys: excludeImageKeys })
+  ]);
+  const normalizedText = text.trim();
+
+  return {
+    text: normalizedText,
+    imageCount,
+    signature: `${normalizedText}\n[images:${imageCount}]`
+  };
 }
 
 async function isGenerationBusyVisible(page) {
@@ -1317,6 +1685,204 @@ async function isGenerationBusyVisible(page) {
   }
 
   return false;
+}
+
+async function countAssistantImages(locator, { page = null, service = webAiService, excludeKeys = new Set() } = {}) {
+  const imageLocators = getAssistantImageCandidateLocators(locator, { page, service, includePageFallback: false });
+  let total = 0;
+  const seen = new Set();
+
+  for (const source of imageLocators) {
+    const images = source.locator;
+    const count = await images.count().catch(() => 0);
+
+    for (let index = 0; index < count; index += 1) {
+      const metadata = await getAssistantImageMetadata(images.nth(index));
+      if (!metadata) continue;
+
+      const key = getAssistantImageKey(metadata);
+      if (excludeKeys.has(key)) continue;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      total += 1;
+    }
+  }
+
+  return total;
+}
+
+async function collectAssistantImageKeys(locator, { page = null, service = webAiService } = {}) {
+  const keys = new Set();
+  const imageLocators = getAssistantImageCandidateLocators(locator, { page, service, includePageFallback: false });
+
+  for (const source of imageLocators) {
+    const images = source.locator;
+    const count = await images.count().catch(() => 0);
+
+    for (let index = 0; index < count; index += 1) {
+      const metadata = await getAssistantImageMetadata(images.nth(index));
+      if (metadata) keys.add(getAssistantImageKey(metadata));
+    }
+  }
+
+  return keys;
+}
+
+async function extractAssistantImages(
+  locator,
+  { page = null, service = webAiService, maxImages = MAX_WEB_AI_IMAGES, excludeKeys = new Set() } = {}
+) {
+  const extracted = [];
+  const seen = new Set(excludeKeys);
+  const scopedSources = getAssistantImageCandidateLocators(locator, { page, service, includePageFallback: false });
+  await extractAssistantImagesFromSources(scopedSources, { extracted, seen, maxImages });
+
+  if (extracted.length === 0 && service === 'chatgpt' && page) {
+    const pageFallbackSources = getAssistantImageCandidateLocators(locator, {
+      page,
+      service,
+      includeScoped: false,
+      includePageFallback: true
+    });
+    await extractAssistantImagesFromSources(pageFallbackSources, { extracted, seen, maxImages });
+  }
+
+  return extracted;
+}
+
+async function extractAssistantImagesFromSources(sources, { extracted, seen, maxImages }) {
+  for (const source of sources) {
+    const images = source.locator;
+    const count = await images.count().catch(() => 0);
+    const indexes = source.reverse
+      ? Array.from({ length: count }, (_, index) => count - 1 - index)
+      : Array.from({ length: count }, (_, index) => index);
+
+    for (const index of indexes) {
+      if (extracted.length >= maxImages) return;
+
+      const image = images.nth(index);
+      const metadata = await getAssistantImageMetadata(image);
+      if (!metadata) continue;
+
+      const key = getAssistantImageKey(metadata);
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      await image.scrollIntoViewIfNeeded({ timeout: 3_000 }).catch(() => {});
+      const buffer = await image.screenshot({ type: 'png', timeout: SELECTOR_TIMEOUT_MS }).catch(() => null);
+      if (!buffer?.length) continue;
+
+      extracted.push({
+        buffer,
+        mimeType: 'image/png',
+        filename: `${source.service}-image-${extracted.length + 1}.png`
+      });
+    }
+  }
+}
+
+function getAssistantImageCandidateLocators(
+  locator,
+  { page = null, service = webAiService, includeScoped = true, includePageFallback = true } = {}
+) {
+  const sources = [];
+
+  if (includeScoped) {
+    sources.push({ locator: locator.locator('img'), service, reverse: false });
+
+    if (service === 'chatgpt') {
+      sources.push(
+        { locator: locator.locator('xpath=ancestor-or-self::article[1]//img'), service, reverse: false },
+        {
+          locator: locator.locator('xpath=ancestor::*[starts-with(@data-testid, "conversation-turn")][1]//img'),
+          service,
+          reverse: false
+        }
+      );
+    }
+  }
+
+  if (includePageFallback && service === 'chatgpt' && page) {
+    sources.push({
+      locator: page.locator(
+        [
+          'main article:has([data-message-author-role="assistant"]) img',
+          'main [data-testid^="conversation-turn"]:has([data-message-author-role="assistant"]) img',
+          'main img[src*="oaiusercontent" i]',
+          'main img[src*="oaidalleapiprodscus" i]',
+          'main img[alt*="generated" i]',
+          'main img[alt*="image" i]',
+          'main img[alt*="gambar" i]'
+        ].join(', ')
+      ),
+      service,
+      reverse: true
+    });
+  }
+
+  return sources;
+}
+
+function getAssistantImageKey(metadata) {
+  return metadata.src || `${metadata.alt}:${Math.round(metadata.width)}x${Math.round(metadata.height)}`;
+}
+
+async function getAssistantImageMetadata(locator) {
+  return locator
+    .evaluate((image, minSize) => {
+      if (!(image instanceof HTMLImageElement)) return null;
+
+      const rect = image.getBoundingClientRect();
+      const style = window.getComputedStyle(image);
+      const src = image.currentSrc || image.src || '';
+      const alt = image.alt || '';
+      const loaded = image.complete && image.naturalWidth > 0 && image.naturalHeight > 0;
+      const visible =
+        rect.width > 0 &&
+        rect.height > 0 &&
+        style.display !== 'none' &&
+        style.visibility !== 'hidden' &&
+        style.opacity !== '0';
+      const largeEnough =
+        Math.max(image.naturalWidth, rect.width) >= minSize && Math.max(image.naturalHeight, rect.height) >= minSize;
+      const looksLikeIcon =
+        /avatar|profile|account|logo|icon|user/i.test(alt) && Math.max(rect.width, rect.height) < minSize * 2;
+      const unsupportedSource = /^data:image\/svg/i.test(src) || /\.svg(?:$|[?#])/i.test(src);
+
+      if (!loaded || !visible || !largeEnough || looksLikeIcon || unsupportedSource) return null;
+
+      return {
+        src,
+        alt,
+        width: rect.width,
+        height: rect.height,
+        naturalWidth: image.naturalWidth,
+        naturalHeight: image.naturalHeight
+      };
+    }, WEB_AI_MIN_IMAGE_SIZE)
+    .catch(() => null);
+}
+
+function createWebAiResult(text, images = []) {
+  return {
+    text: String(text || '').trim(),
+    images: images.filter((image) => image?.buffer?.length)
+  };
+}
+
+function isImageGenerationRequest(question) {
+  const text = String(question || '').toLowerCase();
+  const createWords = 'buat(?:kan|in)?|bikin(?:kan|in)?|gambarkan|gambarin|lukis|generate|create|draw|desain|design';
+  const imageWords = 'gambar|image|foto|photo|ilustrasi|illustration|logo|poster|stiker|sticker|wallpaper|avatar';
+  return (
+    new RegExp(`\\b(${createWords})\\b[\\s\\S]{0,100}\\b(${imageWords})\\b`, 'i').test(text) ||
+    new RegExp(`\\b(${imageWords})\\b[\\s\\S]{0,100}\\b(${createWords})\\b`, 'i').test(text)
+  );
+}
+
+function isImageUnavailableText(text) {
+  return /\b(can'?t|cannot|unable|not able|tidak bisa|nggak bisa|gak bisa|maaf)\b/i.test(String(text || ''));
 }
 
 async function waitForSelectorOrSessionError(page, locator, selector) {
@@ -1420,8 +1986,138 @@ function extractText(message) {
   ).trim();
 }
 
+function hasWebAiInputImage(message) {
+  return getWebAiInputImageCandidates(message).length > 0;
+}
+
+async function downloadWebAiInputImages(sock, message) {
+  const candidates = getWebAiInputImageCandidates(message).slice(0, MAX_WEB_AI_INPUT_IMAGES);
+  const images = [];
+
+  for (let index = 0; index < candidates.length; index += 1) {
+    const candidate = candidates[index];
+    const fileLength = parseFileLength(candidate.media.fileLength);
+    if (fileLength > MAX_WEB_AI_INPUT_IMAGE_BYTES) {
+      throw new Error(
+        `Gambar terlalu besar (${formatBytes(fileLength)}). Maksimal ${formatBytes(MAX_WEB_AI_INPUT_IMAGE_BYTES)}.`
+      );
+    }
+
+    const buffer = await downloadMediaMessage(
+      candidate.message,
+      'buffer',
+      {},
+      {
+        logger,
+        reuploadRequest: sock.updateMediaMessage
+      }
+    );
+
+    if (buffer.length > MAX_WEB_AI_INPUT_IMAGE_BYTES) {
+      throw new Error(
+        `Gambar terlalu besar (${formatBytes(buffer.length)}). Maksimal ${formatBytes(MAX_WEB_AI_INPUT_IMAGE_BYTES)}.`
+      );
+    }
+
+    const mimeType = normalizeImageMimeType(candidate.media.mimetype);
+    images.push({
+      buffer,
+      mimeType,
+      filename: candidate.media.fileName || `whatsapp-image-${index + 1}.${getImageExtension(mimeType)}`
+    });
+  }
+
+  return images;
+}
+
+function getWebAiInputImageCandidates(message) {
+  const candidates = [];
+  const content = unwrapEphemeral(message.message);
+  const directMedia = getImageMediaContent(content);
+  if (directMedia) {
+    candidates.push({ message, media: directMedia });
+  }
+
+  const contextInfo = getMessageContextInfo(content);
+  const quotedContent = unwrapEphemeral(contextInfo?.quotedMessage);
+  const quotedMedia = getImageMediaContent(quotedContent);
+  if (quotedMedia) {
+    candidates.push({
+      message: {
+        key: {
+          remoteJid: message.key?.remoteJid,
+          id: contextInfo?.stanzaId,
+          participant: contextInfo?.participant
+        },
+        message: contextInfo.quotedMessage
+      },
+      media: quotedMedia
+    });
+  }
+
+  return candidates;
+}
+
+function getImageMediaContent(content) {
+  const imageMessage = content?.imageMessage;
+  if (imageMessage && isSupportedInputImageMimeType(imageMessage.mimetype, { allowMissing: true })) return imageMessage;
+
+  const documentMessage = content?.documentMessage;
+  if (documentMessage && isSupportedInputImageMimeType(documentMessage.mimetype)) return documentMessage;
+
+  return null;
+}
+
+function getMessageContextInfo(content) {
+  for (const value of Object.values(content || {})) {
+    if (value?.contextInfo) return value.contextInfo;
+  }
+
+  return null;
+}
+
+function isSupportedInputImageMimeType(mimeType, { allowMissing = false } = {}) {
+  if (!mimeType) return allowMissing;
+  return /^image\/(png|jpe?g|webp)$/i.test(String(mimeType));
+}
+
+function normalizeImageMimeType(mimeType) {
+  const normalized = String(mimeType || '').split(';')[0].trim().toLowerCase();
+  if (/^image\/(png|jpe?g|webp)$/.test(normalized)) return normalized === 'image/jpg' ? 'image/jpeg' : normalized;
+  return 'image/jpeg';
+}
+
+function getImageExtension(mimeType) {
+  const normalized = normalizeImageMimeType(mimeType);
+  if (normalized === 'image/png') return 'png';
+  if (normalized === 'image/webp') return 'webp';
+  return 'jpg';
+}
+
+function parseFileLength(value) {
+  if (!value) return 0;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+  if (typeof value === 'bigint') return Number(value);
+  if (typeof value === 'string') return Number.parseInt(value, 10) || 0;
+  if (typeof value.toNumber === 'function') return value.toNumber();
+  return Number(value) || 0;
+}
+
+function formatBytes(value) {
+  const bytes = Math.max(0, Number(value) || 0);
+  if (bytes < 1024 * 1024) return `${Math.ceil(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 function unwrapEphemeral(content) {
-  return content?.ephemeralMessage?.message || content?.viewOnceMessage?.message || content;
+  return (
+    content?.ephemeralMessage?.message ||
+    content?.viewOnceMessage?.message ||
+    content?.viewOnceMessageV2?.message ||
+    content?.viewOnceMessageV2Extension?.message ||
+    content?.documentWithCaptionMessage?.message ||
+    content
+  );
 }
 
 function resolveQuestion({ body, isGroup }) {
@@ -1616,6 +2312,18 @@ function buildModePrompt(question, mode) {
     'Pertanyaan user:',
     question
   ].join('\n');
+}
+
+function buildChatGptPrompt(question, mode) {
+  if (isImageGenerationRequest(question)) {
+    return [
+      'Gunakan fitur pembuatan gambar ChatGPT untuk membuat gambar aktual. Jangan jawab dengan ASCII art atau deskripsi teks saja.',
+      '',
+      question
+    ].join('\n');
+  }
+
+  return buildModePrompt(question, mode);
 }
 
 function getModeInstruction(mode) {
@@ -1835,6 +2543,48 @@ async function sendLongText(sock, jid, text, quotedMessage) {
   for (const chunk of splitWhatsAppText(text)) {
     await sock.sendMessage(jid, { text: chunk, linkPreview: null }, { quoted: quotedMessage });
   }
+}
+
+async function sendWebAiAnswer(sock, jid, answer, fallbackText, quotedMessage, service = webAiService) {
+  const result = normalizeWebAiResult(answer);
+  const label = getWebAiLabel(service);
+
+  if (result.text) {
+    await sendLongText(sock, jid, result.text, quotedMessage);
+  }
+
+  for (let index = 0; index < result.images.length; index += 1) {
+    const image = result.images[index];
+    const caption =
+      result.images.length > 1 ? `Gambar dari ${label} (${index + 1}/${result.images.length})` : `Gambar dari ${label}`;
+
+    await sock.sendMessage(
+      jid,
+      {
+        image: image.buffer,
+        mimetype: image.mimeType || 'image/png',
+        fileName: image.filename || `${String(service).toLowerCase()}-image-${index + 1}.png`,
+        caption
+      },
+      { quoted: index === 0 ? quotedMessage : undefined }
+    );
+  }
+
+  if (!result.text && result.images.length === 0) {
+    await sendLongText(sock, jid, fallbackText, quotedMessage);
+  }
+}
+
+function normalizeWebAiResult(answer) {
+  if (typeof answer === 'string') {
+    return createWebAiResult(answer);
+  }
+
+  if (!answer || typeof answer !== 'object') {
+    return createWebAiResult('');
+  }
+
+  return createWebAiResult(answer.text, Array.isArray(answer.images) ? answer.images : []);
 }
 
 async function reactToMessage(sock, jid, message, text) {
